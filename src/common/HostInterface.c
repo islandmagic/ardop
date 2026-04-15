@@ -2108,7 +2108,7 @@ void ProcessCommandFromHost(char * strCMD)
 				goto cmddone;
 			}
 			// !TXEnabled
-			if (OpenSoundPlayback("RESTORE", getCch(true))) {
+			if (OpenSoundPlayback("RESTORE", getPch(true))) {
 				snprintf(cmdReply, sizeof(cmdReply), "%s now TRUE", strCMD);
 				SendReplyToHost(cmdReply);
 				ZF_LOGD("%s now TRUE", strCMD);
@@ -2140,6 +2140,7 @@ void ProcessCommandFromHost(char * strCMD)
 	///////////////////////////////////////////////////////////////
 	if (strcmp(strCMD, "TXFRAME") == 0)
 	{
+		const char *txframe_last_fault(void);
 		// Like all other host commands that initiate transmitting, MYCALL must
 		// be set first.
 		if (!stationid_ok(&Callsign)) {
@@ -2155,7 +2156,7 @@ void ProcessCommandFromHost(char * strCMD)
 			// cmdCopy starts with arbitrary cased "txframe "
 			// and has a max length of 2100.
 			if(txframe(cmdCopy) != 0)
-				snprintf(strFault, sizeof(strFault), "FAILED TXFRAME");
+				snprintf(strFault, sizeof(strFault), "FAILED TXFRAME (%s)", txframe_last_fault());
 		}
 		goto cmddone;
 	}

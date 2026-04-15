@@ -183,9 +183,18 @@ int bytes2hex(char *outputStr, size_t count, unsigned char *data,
 
 // transmit a single frame for diagnostic purposes
 // return 0 on success, 1 on failure
+static char g_txframe_fault[160] = "";
+
+const char *txframe_last_fault(void)
+{
+	return g_txframe_fault[0] ? g_txframe_fault : "unknown";
+}
+
 int txframe(char * frameParams) {
+	snprintf(g_txframe_fault, sizeof(g_txframe_fault), "unknown");
 	if (!TXEnabled) {
 		ZF_LOGW("txframe() called when not TXEnabled. Ignoring.");
+		snprintf(g_txframe_fault, sizeof(g_txframe_fault), "TXENABLED FALSE (PLAYBACK required)");
 		return 1;
 	}
 	unsigned char sessionid;
@@ -193,7 +202,10 @@ int txframe(char * frameParams) {
 	int paramcount = parse_params(frameParams, params);
 	if (paramcount < 2)
 		// no frame type
+	{
+		snprintf(g_txframe_fault, sizeof(g_txframe_fault), "missing frame type");
 		return (1);
+	}
 
 	blnEnbARQRpt = false;
 	// Any param equal to "_" means use the value of the corrsponding global
@@ -226,10 +238,14 @@ int txframe(char * frameParams) {
 		// from ARQ.c/ProcessRcvdARQFrame()
 		if ((EncLen = EncodeDATANAK(quality, sessionid, bytEncodedBytes)) <= 0) {
 			ZF_LOGE("ERROR: In txframe() DataNAK Invalid EncLen (%d).", EncLen);
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "encode DataNAK failed (EncLen=%d)", EncLen);
 			return 1;
 		}
 		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength))
+		{
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "Mod4FSKDataAndPlay failed");
 			return 1;
+		}
 	} else if (strcmp(params[1], "BREAK") == 0) {
 		// TXFRAME BREAK [sessionid]
 		// 0x20 - 0x22 unused
@@ -242,10 +258,14 @@ int txframe(char * frameParams) {
 		ZF_LOGD("TXFRAME BREAK 0x%02X", sessionid);
 		if ((EncLen = Encode4FSKControl(BREAK, sessionid, bytEncodedBytes)) <= 0) {
 			ZF_LOGE("ERROR: In txframe() BREAK Invalid EncLen (%d).", EncLen);
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "encode BREAK failed (EncLen=%d)", EncLen);
 			return 1;
 		}
 		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength))
+		{
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "Mod4FSKDataAndPlay failed");
 			return 1;
+		}
 	} else if(strcmp(params[1], "IDLE") == 0) {
 		// TXFRAME IDLE [sessionid]
 		// 0x24 IDLE
@@ -260,8 +280,10 @@ int txframe(char * frameParams) {
 			ZF_LOGE("ERROR: In txframe() IDLE Invalid EncLen (%d).", EncLen);
 			return 1;
 		}
-		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength))
+		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength)) {
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "Mod4FSKDataAndPlay failed");
 			return 1;
+		}
 	} else if(strcmp(params[1], "DISC") == 0) {
 		// TXFRAME DISC [sessionid]
 		// 0x25 - 0x28 unused
@@ -277,8 +299,10 @@ int txframe(char * frameParams) {
 			ZF_LOGE("ERROR: In txframe() DISC Invalid EncLen (%d).", EncLen);
 			return 1;
 		}
-		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength))
+		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength)) {
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "Mod4FSKDataAndPlay failed");
 			return 1;
+		}
 	} else if(strcmp(params[1], "END") == 0) {
 		// TXFRAME END [sessionid]
 		// 0x2A - 0x2B unused
@@ -294,8 +318,10 @@ int txframe(char * frameParams) {
 			ZF_LOGE("ERROR: In txframe() END Invalid EncLen (%d).", EncLen);
 			return 1;
 		}
-		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength))
+		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength)) {
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "Mod4FSKDataAndPlay failed");
 			return 1;
+		}
 	} else if(strcmp(params[1], "ConRejBusy") == 0) {
 		// TXFRAME ConRejBusy [sessioid]
 		// 0x2D ConRejBusy
@@ -368,10 +394,13 @@ int txframe(char * frameParams) {
 		// SendID() always uses global GridSquare, so don't use is here.
 		if ((EncLen = Encode4FSKIDFrame(&callsign, &grid, bytEncodedBytes)) <= 0) {
 			ZF_LOGE("ERROR: In txframe() IDFrame Invalid EncLen (%d).", EncLen);
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "encode IDFrame failed (EncLen=%d)", EncLen);
 			return 1;
 		}
-		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength))
+		if (!Mod4FSKDataAndPlay(bytEncodedBytes[0], &bytEncodedBytes[0], EncLen, LeaderLength)) {
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "Mod4FSKDataAndPlay failed");
 			return 1;
+		}
 	} else if(strncmp(params[1], "ConReq", 6) == 0) {
 		// TXFRAME ConReq target [mycall] [bandwidth]
 		// TXFRAME ConReqXXXX target [mycallsign]
@@ -740,6 +769,7 @@ int txframe(char * frameParams) {
 		}
 		if (frametype == 0x7E) {
 			ZF_LOGW("TXFRAME: Unknown frame type=%s", params[1]);
+			snprintf(g_txframe_fault, sizeof(g_txframe_fault), "unknown frame type \"%s\"", params[1]);
 			return (1);
 		}
 	}

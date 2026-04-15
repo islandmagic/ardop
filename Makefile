@@ -78,6 +78,16 @@ OBJS_LIN = \
 	$(BUILDDIR)/src/linux/ALSA.o \
 	$(BUILDDIR)/src/linux/os_util.o \
 
+# iOS-only object files (embedded-only, no TCP host)
+OBJS_IOS = \
+	$(BUILDDIR)/src/ios/ardop_host_ios_stub.o \
+	$(BUILDDIR)/src/ios/ios_os_util.o \
+	$(BUILDDIR)/src/ios/ios_rig_stub.o \
+	$(BUILDDIR)/src/ios/ios_audio_globals.o \
+	$(BUILDDIR)/src/ios/ios_nslog.o \
+	$(BUILDDIR)/src/ios/IOSAudioEngine.o \
+	$(BUILDDIR)/src/ios/ArdopKit.o \
+
 # macOS-only object files (stubs for initial scaffolding)
 OBJS_MAC = \
 	$(BUILDDIR)/src/macos/CoreAudioSound.o \
@@ -157,6 +167,9 @@ WIN32 ?= $(filter $(OS),Windows_NT)
 
 # Determine build directory based on target platform
 UNAME_S := $(shell uname -s)
+
+# Allow caller to override PLATFORM, e.g. `make PLATFORM=ios ...`
+ifeq ($(strip $(PLATFORM)),)
 ifneq ($(WIN32),)
 PLATFORM := windows
 OBJS += $(OBJS_WIN)
@@ -177,9 +190,33 @@ OBJS += $(OBJS_LIN)
 LDLIBS += -lrt -lasound
 endif
 endif
+endif
 
 # Build directory structure
 BUILDDIR := build/$(PLATFORM)
+
+# Platform family helper (e.g. ios, ios-sim-arm64, ios-sim-x86_64)
+PLATFORM_FAMILY := $(firstword $(subst -, ,$(PLATFORM)))
+
+# When cross-compiling (e.g. PLATFORM=ios with CC pointing at an iOS SDK),
+# ensure txt2c is built for the build host so it can run.
+ifeq ($(PLATFORM_FAMILY),ios)
+ifneq ($(origin CC_NATIVE),command line)
+CC_NATIVE := xcrun --sdk macosx clang
+endif
+endif
+
+# iOS embedded-only build: omit TCP host, use stubs.
+ifeq ($(PLATFORM_FAMILY),ios)
+OBJS := $(filter-out $(BUILDDIR)/src/common/TCPHostInterface.o,$(OBJS))
+OBJS += $(OBJS_IOS)
+CPPFLAGS += -DARDOP_HOST_EMBEDDED=1
+LDLIBS += -framework Foundation -framework CoreFoundation -framework AVFoundation
+# ObjC++ / exceptions runtime
+LDLIBS += -lc++ -lc++abi
+# iOS: don't link libpthread explicitly (Apple platforms use libc for pthreads)
+LDLIBS := $(filter-out -lpthread,$(LDLIBS))
+endif
 
 # Detect Homebrew-installed cmocka on macOS and add include/lib paths so tests build
 ifeq ($(PLATFORM),macos)
@@ -244,9 +281,53 @@ endif
 
 ardopcf: $(BUILDDIR)/ardopcf
 
+# Static library build (no executable / no main).
+#
+# Note: the resulting library contains the embedded host + audio backend and is
+# suitable for wrapping in an XCFramework for iOS app embedding.
+OBJS_LIB = $(filter-out $(BUILDDIR)/src/common/ardopcf.o,$(OBJS))
+
+libardopkit: $(BUILDDIR)/libArdopKit.a
+
+$(BUILDDIR)/libArdopKit.a: $(OBJS_LIB)
+	@$(call MKDIR,$(dir $@))
+	@if [ "$(PLATFORM_FAMILY)" = "ios" ] || [ "$(PLATFORM)" = "macos" ]; then \
+		xcrun --sdk $(if $(filter ios,$(PLATFORM_FAMILY)),iphoneos,macosx) libtool -static -o $@ $^; \
+	else \
+		$(AR) rcs $@ $^; \
+	fi
+
+xcframework-ios:
+	@set -e; \
+	$(MAKE) libardopkit PLATFORM=ios \
+		CC="xcrun --sdk iphoneos clang" \
+		CFLAGS="-g -O2 -MMD -target arm64-apple-ios18.5" \
+		LDFLAGS="-target arm64-apple-ios18.5"; \
+	$(MAKE) libardopkit PLATFORM=ios-sim-arm64 \
+		CC="xcrun --sdk iphonesimulator clang" \
+		CFLAGS="-g -O2 -MMD -target arm64-apple-ios18.5-simulator" \
+		LDFLAGS="-target arm64-apple-ios18.5-simulator"; \
+	$(MAKE) libardopkit PLATFORM=ios-sim-x86_64 \
+		CC="xcrun --sdk iphonesimulator clang" \
+		CFLAGS="-g -O2 -MMD -target x86_64-apple-ios18.5-simulator" \
+		LDFLAGS="-target x86_64-apple-ios18.5-simulator"; \
+	$(call MKDIR,build/xcframework-headers); \
+	cp src/ios/ArdopKit.h build/xcframework-headers/; \
+	cp src/ios/ArdopKit.modulemap build/xcframework-headers/module.modulemap; \
+	$(call MKDIR,build/xcframework-tmp); \
+	xcrun lipo -create \
+		build/ios-sim-arm64/libArdopKit.a \
+		build/ios-sim-x86_64/libArdopKit.a \
+		-output build/xcframework-tmp/libArdopKit-sim.a; \
+	rm -rf build/ArdopKit.xcframework; \
+	xcodebuild -create-xcframework \
+		-library build/ios/libArdopKit.a -headers build/xcframework-headers \
+		-library build/xcframework-tmp/libArdopKit-sim.a -headers build/xcframework-headers \
+		-output build/ArdopKit.xcframework
+
 $(BUILDDIR)/ardopcf: $(OBJS_EXE) $(OBJS)
-	# macOS ld64 rejects -Map option; only use map file on non-macOS
-	@if [ "$(PLATFORM)" = "macos" ]; then \
+	# Apple ld64 (macOS/iOS) rejects GNU -Map; only use map file on non-Apple ld
+	@if [ "$(PLATFORM)" = "macos" ] || [ "$(PLATFORM_FAMILY)" = "ios" ]; then \
 		$(CC) $(LDFLAGS) $^ -o $@ $(LOADLIBES) $(LDLIBS); \
 	else \
 		$(CC) $(LDFLAGS) -Xlinker -Map=$(BUILDDIR)/output.map $^ -o $@ $(LOADLIBES) $(LDLIBS); \
@@ -321,6 +402,16 @@ $(BUILDDIR)/test/ardop/test_ARDOPCommon_processargs: WRAP := \
 $(BUILDDIR)/%.o: %.c
 	@$(call MKDIR,$(dir $@))
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+# Objective-C sources (iOS shims)
+$(BUILDDIR)/%.o: %.m
+	@$(call MKDIR,$(dir $@))
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fobjc-arc -x objective-c -c $< -o $@
+
+# Objective-C++ sources (iOS audio backend)
+$(BUILDDIR)/%.o: %.mm
+	@$(call MKDIR,$(dir $@))
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fobjc-arc -x objective-c++ -c $< -o $@
 
 # Include dependency files
 -include $(OBJS:.o=.d) $(OBJS_EXE:.o=.d) $(TEST_OBJS_COMMON:.o=.d)

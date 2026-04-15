@@ -12,6 +12,10 @@
 #define LOG_OUTPUT_SYSLOG
 #endif
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include "log_file.h"
 
 // Configure log decoration, see zf_log.c
@@ -174,8 +178,23 @@ static void log_callback(const zf_log_message* msg, void* param) {
 
 	if (msg->lvl >= ArdopLogVerbosityConsole)
 	{
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+		// iOS: route console logs via an Objective-C shim so apps can
+		// intercept/merge logs in one place (NSLog-style).
+		extern void ardop_ios_nslog(const char *line);
+		char line[ZF_LOG_BUF_SZ + 8];
+		size_t n = (size_t)(msg->p - msg->msg_b);
+		if (n >= sizeof(line))
+			n = sizeof(line) - 1;
+		memcpy(line, msg->msg_b, n);
+		line[n] = '\0';
+		// Strip trailing newline; NSLog will add its own.
+		size_t ln = strlen(line);
+		if (ln > 0 && line[ln - 1] == '\n')
+			line[ln - 1] = '\0';
+		ardop_ios_nslog(line);
+#elif defined(_WIN32) || defined(_WIN64)
 		// write undecorated message to stdout
-#if defined(_WIN32) || defined(_WIN64)
 		/* WriteFile() is atomic for local files opened with FILE_APPEND_DATA and
 		without FILE_WRITE_DATA */
 		DWORD written;

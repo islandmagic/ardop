@@ -708,8 +708,12 @@ void ardopmain() {
 	//	txwff = NULL;
 	//}
 
-	closesocket(TCPControlSock);
-	closesocket(TCPDataSock);
+	// On embedded builds (e.g. iOS) the TCP host interface is omitted and these
+	// sockets are never opened. Avoid closing stdin (fd=0) or invalid fds.
+	if (TCPControlSock > 0)
+		closesocket(TCPControlSock);
+	if (TCPDataSock > 0)
+		closesocket(TCPDataSock);
 	FreeDevices(&AudioDevices);
 	return;
 }
