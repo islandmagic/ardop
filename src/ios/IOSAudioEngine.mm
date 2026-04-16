@@ -7,16 +7,20 @@
  * - RX: installTap on inputNode, convert to 12kHz mono int16, then deliver
  *       ReceiveSize blocks to ProcessNewSamples() when Capturing else
  *       PreprocessNewSamples().
- * - TX: SendtoCard() enqueues 12kHz int16 blocks from txbuffer into a ring.
- *       A playerNode drains the ring by scheduling converted buffers to the
- *       output format. SoundFlush() appends trailer and blocks until drained.
- *
- * This is a first-pass implementation; it aims for correctness over perfect
- * real-time efficiency.
+ * - TX: SendtoCard() copies 12kHz int16 into a ring (same sizing idea as macOS
+ *       CoreAudioSound.c). AVAudioSourceNode pulls continuously at the hardware
+ *       rate and applies the same linear SRC as macOS’s non-converter path —
+ *       no per-chunk AVAudioConverter / AVAudioPlayerNode scheduling for modem
+ *       audio (avoids truncated playback and graph churn).
+ * - SoundFlush() waits for the ring / pending sample counts to drain (macOS-
+ *   style polling), then resets TX state.
  */
 
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
+
+#include <atomic>
+#include <cstring>
 
 extern "C" {
 #include <stdbool.h>
@@ -68,67 +72,194 @@ extern "C" bool Capturing;
 
 static const double kArdopSampleRate = 12000.0;
 
-// ---- Simple ring buffer for 12kHz int16 TX ---------------------------------
-static pthread_mutex_t tx_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t tx_cv = PTHREAD_COND_INITIALIZER;
+// ---- TX ring @ 12 kHz (mirrors macOS CoreAudioSound.c SendtoCard + render) -
+#define IOS_TX_RINGBUF_SIZE (SendSize * 256)
+static short ios_tx_ringbuf[IOS_TX_RINGBUF_SIZE];
+static volatile int ios_ringbuf_write = 0;
+static volatile int ios_ringbuf_read = 0;
+// Sample count in ring: updated from modem thread (SendtoCard) and audio render thread — must be atomic.
+static std::atomic<int> ios_ringbuf_count{0};
+static volatile uint64_t ios_txSamplesQueued = 0;
+static volatile uint64_t ios_txSamplesPlayed = 0;
+static volatile float ios_srcPosition = 0.0f;
+static std::atomic<bool> ios_audioPlaying{false};
+static std::atomic<bool> ios_audioFinished{false};
+static volatile double ios_tx_output_sample_rate = 48000.0;
 
-// ~10 seconds at 12kHz
-#define TX_RING_CAP (12000 * 10)
-static int16_t tx_ring[TX_RING_CAP];
-static size_t tx_r = 0;
-static size_t tx_w = 0;
-static size_t tx_n = 0;
+// Render-side telemetry (helps prove whether AVAudioSourceNode is being pulled).
+static std::atomic<uint64_t> ios_tx_render_calls{0};
+static std::atomic<uint64_t> ios_tx_render_frames{0};
+static std::atomic<uint64_t> ios_tx_render_nonzero_frames{0};
+static std::atomic<int> ios_tx_last_sample_i16{0};
 
-static bool tx_stopping = false;
-static bool tx_player_active = false;
-
-static void tx_ring_reset(void)
+static inline uint64_t ios_tx_samples_pending(void)
 {
-	pthread_mutex_lock(&tx_mu);
-	tx_r = tx_w = tx_n = 0;
-	pthread_mutex_unlock(&tx_mu);
+	uint64_t queued = ios_txSamplesQueued;
+	uint64_t played = ios_txSamplesPlayed;
+	return (queued > played) ? (queued - played) : 0;
 }
 
-static size_t tx_ring_push(const int16_t *in, size_t n)
+static inline void ios_tx_reset_counters(void)
 {
-	size_t pushed = 0;
-	pthread_mutex_lock(&tx_mu);
-	for (size_t i = 0; i < n; i++)
+	ios_txSamplesQueued = 0;
+	ios_txSamplesPlayed = 0;
+}
+
+static void ios_tx_ring_reset_all(void)
+{
+	ios_ringbuf_read = 0;
+	ios_ringbuf_write = 0;
+	ios_ringbuf_count.store(0, std::memory_order_relaxed);
+	ios_tx_reset_counters();
+	ios_srcPosition = 0.0f;
+	ios_audioPlaying.store(false, std::memory_order_relaxed);
+	ios_audioFinished.store(false, std::memory_order_relaxed);
+	ios_tx_render_calls.store(0, std::memory_order_relaxed);
+	ios_tx_render_frames.store(0, std::memory_order_relaxed);
+	ios_tx_render_nonzero_frames.store(0, std::memory_order_relaxed);
+	ios_tx_last_sample_i16.store(0, std::memory_order_relaxed);
+}
+
+// RT-safe: no heap, no ObjC, no lambdas (AVAudioSourceNode callback is realtime).
+static void ios_tx_zero_audio_buffer_list(BOOL *isSilence, AudioBufferList *ioData)
+{
+	for (UInt32 bi = 0; bi < ioData->mNumberBuffers; bi++)
 	{
-		if (tx_n >= TX_RING_CAP)
-			break;
-		tx_ring[tx_w] = in[i];
-		tx_w = (tx_w + 1) % TX_RING_CAP;
-		tx_n++;
-		pushed++;
+		void *data = ioData->mBuffers[bi].mData;
+		UInt32 bytes = ioData->mBuffers[bi].mDataByteSize;
+		if (data && bytes > 0)
+			memset(data, 0, (size_t)bytes);
 	}
-	pthread_cond_signal(&tx_cv);
-	pthread_mutex_unlock(&tx_mu);
-	return pushed;
+	if (isSilence)
+		*isSilence = YES;
 }
 
-static size_t tx_ring_pop(int16_t *out, size_t maxn)
+// Real-time render: AudioBufferList path (matches AVAudioSourceNode on current SDK).
+// No logging, no locks (same model as macOS volatile ring).
+static OSStatus ios_tx_source_render(BOOL *isSilence, const AudioTimeStamp *when, AVAudioFrameCount inNumberFrames,
+	AudioBufferList *ioData)
 {
-	size_t popped = 0;
-	pthread_mutex_lock(&tx_mu);
-	while (tx_n == 0 && !tx_stopping)
-		pthread_cond_wait(&tx_cv, &tx_mu);
-	while (popped < maxn && tx_n > 0)
+	(void)when;
+	if (!ioData || ioData->mNumberBuffers < 1 || inNumberFrames < 1)
+		return noErr;
+
+	const UInt32 frameCount = (UInt32)inNumberFrames;
+	ios_tx_render_calls.fetch_add(1, std::memory_order_relaxed);
+	ios_tx_render_frames.fetch_add((uint64_t)frameCount, std::memory_order_relaxed);
+
+	// Do not gate on TXEnabled here: it is a plain bool updated from other threads and
+	// can be observed stale on the render thread, silencing all output. Ring + playing
+	// flags are sufficient (macOS gates on TXEnabled in-process single-threaded model).
+	if (!ios_audioPlaying.load(std::memory_order_acquire))
 	{
-		out[popped++] = tx_ring[tx_r];
-		tx_r = (tx_r + 1) % TX_RING_CAP;
-		tx_n--;
+		ios_tx_zero_audio_buffer_list(isSilence, ioData);
+		return noErr;
 	}
-	pthread_mutex_unlock(&tx_mu);
-	return popped;
-}
 
-static size_t tx_ring_count(void)
-{
-	pthread_mutex_lock(&tx_mu);
-	size_t n = tx_n;
-	pthread_mutex_unlock(&tx_mu);
-	return n;
+	if (!ioData->mBuffers[0].mData)
+	{
+		ios_tx_zero_audio_buffer_list(isSilence, ioData);
+		return noErr;
+	}
+
+	if (isSilence)
+		*isSilence = NO;
+
+	const double dstRate = (ios_tx_output_sample_rate > 1.0) ? ios_tx_output_sample_rate : 48000.0;
+	const double srcRate = kArdopSampleRate;
+	const double rateRatio = srcRate / dstRate;
+	double srcPos = (double)ios_srcPosition;
+
+	const bool deinterleavedPlanes =
+		(ioData->mNumberBuffers > 1 && ioData->mBuffers[0].mNumberChannels == 1);
+
+	for (UInt32 frame = 0; frame < frameCount; frame++)
+	{
+		int srcIndex0 = (int)srcPos;
+		int srcIndex1 = srcIndex0 + 1;
+		double frac = srcPos - (double)srcIndex0;
+		short s0 = 0, s1 = 0;
+		const int rc = ios_ringbuf_count.load(std::memory_order_acquire);
+
+		if (rc > srcIndex1)
+		{
+			int idx0 = (ios_ringbuf_read + srcIndex0) % IOS_TX_RINGBUF_SIZE;
+			int idx1 = (ios_ringbuf_read + srcIndex1) % IOS_TX_RINGBUF_SIZE;
+			s0 = ios_tx_ringbuf[idx0];
+			s1 = ios_tx_ringbuf[idx1];
+		}
+		else if (rc > srcIndex0)
+		{
+			int idx0 = (ios_ringbuf_read + srcIndex0) % IOS_TX_RINGBUF_SIZE;
+			s0 = ios_tx_ringbuf[idx0];
+			s1 = s0;
+		}
+		else
+		{
+			// Underrun: only drop the playing flag if nothing is still committed for playback
+			// (avoids a torn/stale ring count from clearing output mid-transmit on ARM).
+			if (ios_audioPlaying.load(std::memory_order_acquire) &&
+			    !ios_audioFinished.load(std::memory_order_acquire) && ios_tx_samples_pending() == 0)
+			{
+				ios_audioFinished.store(true, std::memory_order_release);
+				ios_audioPlaying.store(false, std::memory_order_release);
+			}
+			s0 = 0;
+			s1 = 0;
+		}
+
+		short sample = (short)((1.0 - frac) * (double)s0 + frac * (double)s1);
+		ios_tx_last_sample_i16.store((int)sample, std::memory_order_relaxed);
+		if (sample != 0)
+			ios_tx_render_nonzero_frames.fetch_add(1, std::memory_order_relaxed);
+		float floatSample = (float)sample / 32768.0f;
+
+		if (deinterleavedPlanes)
+		{
+			for (UInt32 bi = 0; bi < ioData->mNumberBuffers; bi++)
+			{
+				float *plane = (float *)ioData->mBuffers[bi].mData;
+				if (plane)
+					plane[frame] = floatSample;
+			}
+		}
+		else
+		{
+			UInt32 cpf = ioData->mBuffers[0].mNumberChannels;
+			if (cpf < 1)
+				cpf = 1;
+			float *out = (float *)ioData->mBuffers[0].mData;
+			for (UInt32 ch = 0; ch < cpf; ch++)
+				out[frame * cpf + ch] = floatSample;
+		}
+
+		srcPos += rateRatio;
+		while (srcPos >= 1.0)
+		{
+			int observed = ios_ringbuf_count.load(std::memory_order_acquire);
+			if (observed < 1)
+				break;
+			int next = observed - 1;
+			if (!ios_ringbuf_count.compare_exchange_weak(observed, next, std::memory_order_acq_rel,
+				    std::memory_order_acquire))
+				continue;
+			ios_ringbuf_read = (ios_ringbuf_read + 1) % IOS_TX_RINGBUF_SIZE;
+			ios_txSamplesPlayed++;
+			srcPos -= 1.0;
+		}
+	}
+
+	ios_srcPosition = (float)srcPos;
+
+	if (ios_ringbuf_count.load(std::memory_order_acquire) == 0 &&
+	    ios_audioPlaying.load(std::memory_order_acquire) &&
+	    !ios_audioFinished.load(std::memory_order_acquire) && ios_tx_samples_pending() == 0)
+	{
+		ios_audioFinished.store(true, std::memory_order_release);
+		ios_audioPlaying.store(false, std::memory_order_release);
+	}
+
+	return noErr;
 }
 
 // ---- RX ring + processing thread (12kHz int16) ------------------------------
@@ -236,16 +367,15 @@ static void rx_thread_stop_if_running(void)
 
 // ---- AVAudioEngine state ---------------------------------------------------
 static AVAudioEngine *engine = nil;
-static AVAudioPlayerNode *player = nil;
+static AVAudioPlayerNode *player = nil; // test tone / optional scheduled playback only
+static AVAudioSourceNode *txSourceNode = nil;
 static AVAudioConverter *rxConverter = nil;
-static AVAudioConverter *txConverter = nil;
 static AVAudioFormat *hwInputFormat = nil;
 static AVAudioFormat *hwOutputFormat = nil;
 static AVAudioFormat *ardopFloatMono12k = nil;
 
-static dispatch_queue_t txScheduleQueue = nil; // schedule TX buffers
-
-static bool audio_started = false;
+// Written on main when starting/stopping AVAudioEngine; read from modem / flush threads.
+static std::atomic<bool> ios_engine_running{false};
 static bool rx_tap_installed = false;
 
 // Session/category is expensive and can stall route negotiation if repeated; do it once.
@@ -253,7 +383,6 @@ static bool g_av_session_configured = false;
 
 // Throttled debug counters to avoid flooding host logs.
 static int g_dbg_sendtocard_lines = 0;
-static int g_dbg_schedule_lines = 0;
 
 // Forward declarations used by debug helpers.
 static void EnsureEngineObjects(void);
@@ -274,34 +403,26 @@ extern "C" void ArdopPlayTestTone(double freq_hz, int duration_ms)
 
 	ardop_run_on_main(^{
 		EnsureEngineObjects();
-		if (!audio_started)
+		if (!ios_engine_running.load(std::memory_order_acquire))
 		{
 			// Ensure the graph is built/running so the player has an output.
 			(void)StartEngineIfNeeded();
 		}
-		if (!audio_started || !hwOutputFormat || !player)
+		if (!ios_engine_running.load(std::memory_order_acquire) || !hwOutputFormat || !player)
 		{
 			NSLog(@"Ardop iOS: ArdopPlayTestTone skipped (engine not started)");
 			return;
 		}
 
-		// Ensure player is connected. Some routes/config changes can leave the node
-		// “disconnected” even while the engine is running.
-		@try
-		{
-			[engine disconnectNodeInput:engine.mainMixerNode];
-		}
-		@catch (__unused NSException *ex)
-		{
-		}
+		// One-time style wiring: do not disconnect the main mixer (that would drop
+		// the modem AVAudioSourceNode). Only ensure the test player reaches the mixer.
 		@try
 		{
 			[engine connect:player to:engine.mainMixerNode format:hwOutputFormat];
-			[engine connect:engine.mainMixerNode to:engine.outputNode format:hwOutputFormat];
 		}
-		@catch (NSException *ex)
+		@catch (__unused NSException *ex)
 		{
-			NSLog(@"Ardop iOS: ArdopPlayTestTone connect exception: %@", ex);
+			// Already connected for this format/graph.
 		}
 
 		const double sr = hwOutputFormat.sampleRate > 1.0 ? hwOutputFormat.sampleRate : 48000.0;
@@ -378,11 +499,20 @@ extern "C" void ArdopAudioDump(char *dst, size_t dstsz)
 		const double sr = hwOutputFormat ? hwOutputFormat.sampleRate : 0.0;
 		const unsigned ch = hwOutputFormat ? (unsigned)hwOutputFormat.channelCount : 0;
 		snprintf(dst, dstsz,
-			"AUDIO tx=%d rx=%d pb=\"%s\" cap=\"%s\" audio_started=%d eng_running=%d player_playing=%d out=%.0fHz/%uch",
+			"AUDIO tx=%d rx=%d pb=\"%s\" cap=\"%s\" engine_running=%d eng_running=%d "
+			"player_playing=%d tx_src=%d ios_ring=%d ios_playing=%d "
+			"tx_render_calls=%llu tx_render_frames=%llu tx_nonzero_frames=%llu tx_last_i16=%d out=%.0fHz/%uch",
 			(int)TXEnabled, (int)RXEnabled,
 			PlaybackDevice[0] ? PlaybackDevice : "NONE",
 			CaptureDevice[0] ? CaptureDevice : "NONE",
-			(int)audio_started, (int)engRunning, (int)(player && player.isPlaying),
+			(int)ios_engine_running.load(std::memory_order_relaxed), (int)engRunning,
+			(int)(player && player.isPlaying),
+			(int)(txSourceNode != nil), (int)ios_ringbuf_count.load(std::memory_order_relaxed),
+			(int)ios_audioPlaying.load(std::memory_order_relaxed),
+			(unsigned long long)ios_tx_render_calls.load(std::memory_order_relaxed),
+			(unsigned long long)ios_tx_render_frames.load(std::memory_order_relaxed),
+			(unsigned long long)ios_tx_render_nonzero_frames.load(std::memory_order_relaxed),
+			(int)ios_tx_last_sample_i16.load(std::memory_order_relaxed),
 			sr, ch);
 	});
 }
@@ -437,8 +567,6 @@ static void StartCaptureInternal(void)
 
 static void EnsureEngineObjects(void)
 {
-	if (!txScheduleQueue)
-		txScheduleQueue = dispatch_queue_create("ardop.ios.txSchedule", DISPATCH_QUEUE_SERIAL);
 	if (!engine)
 		engine = [[AVAudioEngine alloc] init];
 	if (!player)
@@ -446,6 +574,33 @@ static void EnsureEngineObjects(void)
 		player = [[AVAudioPlayerNode alloc] init];
 		[engine attachNode:player];
 	}
+}
+
+// Log current AVAudioSession route (helps debug “no audio” vs stale PlaybackDevice strings).
+static void LogAudioSessionRoute(const char *tag)
+{
+	AVAudioSession *session = [AVAudioSession sharedInstance];
+	AVAudioSessionRouteDescription *route = session.currentRoute;
+	NSUInteger nOut = route.outputs.count;
+	NSUInteger nIn = route.inputs.count;
+	NSMutableString *outs = [NSMutableString stringWithCapacity:256];
+	for (AVAudioSessionPortDescription *p in route.outputs)
+	{
+		if (outs.length)
+			[outs appendString:@"; "];
+		[outs appendFormat:@"%@ (type=%ld)", p.portName, (long)p.portType];
+	}
+	NSMutableString *ins = [NSMutableString stringWithCapacity:256];
+	for (AVAudioSessionPortDescription *p in route.inputs)
+	{
+		if (ins.length)
+			[ins appendString:@"; "];
+		[ins appendFormat:@"%@ (type=%ld)", p.portName, (long)p.portType];
+	}
+	NSLog(@"Ardop iOS: route[%s] in=%lu out=%lu | inputs: %@ | outputs: %@", tag, (unsigned long)nIn,
+		(unsigned long)nOut, ins.length ? ins : @"(none)", outs.length ? outs : @"(none)");
+	ZF_LOGI("Ardop iOS: route[%s] in=%lu out=%lu inputs=%s outputs=%s", tag, (unsigned long)nIn,
+		(unsigned long)nOut, ins.length ? ins.UTF8String : "(none)", outs.length ? outs.UTF8String : "(none)");
 }
 
 // Caller must be on the main thread (see ardop_run_on_main / ardop_run_on_main_timed).
@@ -503,6 +658,7 @@ static bool ConfigureSession(void)
 		session.IOBufferDuration);
 	ZF_LOGI("Ardop iOS: ConfigureSession ok sr=%.0f ioBuf=%.4fs", session.sampleRate,
 		session.IOBufferDuration);
+	LogAudioSessionRoute("after_configure");
 	return true;
 }
 
@@ -536,11 +692,9 @@ static bool BuildConverters(AVAudioFormat *forcedHwOutFmt)
 		(unsigned int)hwOutputFormat.channelCount);
 
 	rxConverter = [[AVAudioConverter alloc] initFromFormat:hwInputFormat toFormat:ardopFloatMono12k];
-	txConverter = [[AVAudioConverter alloc] initFromFormat:ardopFloatMono12k toFormat:hwOutputFormat];
-	if (!rxConverter || !txConverter)
+	if (!rxConverter)
 	{
-		ZF_LOGE("AVAudioConverter init failed (rx=%p tx=%p)", (__bridge void *)rxConverter,
-			(__bridge void *)txConverter);
+		ZF_LOGE("AVAudioConverter init failed (rx=%p)", (__bridge void *)rxConverter);
 		return false;
 	}
 	return true;
@@ -653,7 +807,7 @@ static void RemoveRxTap(void)
 
 static bool StartEngineIfNeeded(void)
 {
-	if (audio_started)
+	if (ios_engine_running.load(std::memory_order_acquire))
 	{
 		ZF_LOGI("Ardop iOS: StartEngineIfNeeded skip (already running)");
 		return true;
@@ -683,9 +837,6 @@ static bool StartEngineIfNeeded(void)
 	{
 	}
 
-	ZF_LOGI("Ardop iOS: engine prepare");
-	[engine prepare];
-
 	AVAudioFormat *outFmt = [engine.outputNode inputFormatForBus:0];
 	if (!outFmt || outFmt.sampleRate < 1.0 || outFmt.channelCount < 1)
 	{
@@ -694,20 +845,122 @@ static bool StartEngineIfNeeded(void)
 		ZF_LOGE("Ardop iOS: bad outputNode input format after prepare");
 		return false;
 	}
+	if (outFmt.commonFormat != AVAudioPCMFormatFloat32)
+	{
+		ZF_LOGE("Ardop iOS: output format must be float32 for TX (commonFormat=%d)", (int)outFmt.commonFormat);
+		return false;
+	}
 	NSLog(@"Ardop iOS: graph outFmt sr=%.1f ch=%u", outFmt.sampleRate, (unsigned int)outFmt.channelCount);
 	ZF_LOGI("Ardop iOS: graph outFmt sr=%.1f ch=%u", outFmt.sampleRate, (unsigned int)outFmt.channelCount);
+	ios_tx_output_sample_rate = outFmt.sampleRate > 1.0 ? outFmt.sampleRate : 48000.0;
 
 	if (mixer && player)
 	{
-		[engine connect:player to:mixer format:outFmt];
-		[engine connect:mixer to:engine.outputNode format:outFmt];
-		player.volume = 1.0f;
-		mixer.outputVolume = 1.0f;
+		@try
+		{
+			if (!txSourceNode)
+			{
+				// Prefer the "no-format" initializer. It avoids edge cases where a deinterleaved
+				// outFmt prevents the node from being pulled on some routes.
+				if ([AVAudioSourceNode instancesRespondToSelector:@selector(initWithRenderBlock:)])
+				{
+					txSourceNode = [[AVAudioSourceNode alloc]
+						initWithRenderBlock:^OSStatus (BOOL *isSilence, const AudioTimeStamp *timestamp,
+							AVAudioFrameCount frameCount, AudioBufferList *ioData) {
+							return ios_tx_source_render(isSilence, timestamp, frameCount, ioData);
+						}];
+				}
+				else
+				{
+					txSourceNode = [[AVAudioSourceNode alloc] initWithFormat:outFmt
+					                                           renderBlock:^OSStatus (BOOL *isSilence,
+					                                                                  const AudioTimeStamp *timestamp,
+					                                                                  AVAudioFrameCount frameCount,
+					                                                                  AudioBufferList *ioData) {
+						return ios_tx_source_render(isSilence, timestamp, frameCount, ioData);
+					}];
+				}
+				if (txSourceNode)
+					[engine attachNode:txSourceNode];
+			}
+			if (txSourceNode)
+				[engine connect:txSourceNode to:mixer format:outFmt];
+			[engine connect:player to:mixer format:outFmt];
+			[engine connect:mixer to:engine.outputNode format:outFmt];
+			player.volume = 1.0f;
+			mixer.outputVolume = 1.0f;
+
+			// One-time graph connectivity dump: helps debug cases where AVAudioSourceNode is not pulled.
+			@try
+			{
+				NSArray<AVAudioConnectionPoint *> *txOut =
+					[engine outputConnectionPointsForNode:txSourceNode outputBus:0];
+				NSArray<AVAudioConnectionPoint *> *plOut =
+					[engine outputConnectionPointsForNode:player outputBus:0];
+				NSArray<AVAudioConnectionPoint *> *mixOut =
+					[engine outputConnectionPointsForNode:mixer outputBus:0];
+				const int txc = (int)txOut.count;
+				const int plc = (int)plOut.count;
+				const int mxc = (int)mixOut.count;
+				ZF_LOGI("Ardop iOS: graph conn txOut=%d plOut=%d mixOut=%d", txc, plc, mxc);
+				NSLog(@"Ardop iOS: graph conn txOut=%d plOut=%d mixOut=%d", txc, plc, mxc);
+				{
+					char msg[200];
+					snprintf(msg, sizeof(msg), "IOSAUDIO graph conn txOut=%d plOut=%d mixOut=%d", txc, plc, mxc);
+					TCPSendReplyToHost(msg);
+				}
+				if (txOut.count > 0)
+					ZF_LOGI("Ardop iOS: graph conn txOut[0] node=%p bus=%u",
+						(__bridge void *)txOut[0].node, (unsigned)txOut[0].bus);
+				if (plOut.count > 0)
+					ZF_LOGI("Ardop iOS: graph conn plOut[0] node=%p bus=%u",
+						(__bridge void *)plOut[0].node, (unsigned)plOut[0].bus);
+				if (mixOut.count > 0)
+					ZF_LOGI("Ardop iOS: graph conn mixOut[0] node=%p bus=%u",
+						(__bridge void *)mixOut[0].node, (unsigned)mixOut[0].bus);
+			}
+			@catch (__unused NSException *ex)
+			{
+				ZF_LOGW("Ardop iOS: graph connectivity dump failed");
+			}
+		}
+		@catch (NSException *ex)
+		{
+			ZF_LOGE("Ardop iOS: graph connect failed: %s", ex.reason.UTF8String);
+			if (txSourceNode)
+			{
+				@try
+				{
+					[engine detachNode:txSourceNode];
+				}
+				@catch (__unused NSException *ex2)
+				{
+				}
+				txSourceNode = nil;
+			}
+			return false;
+		}
 	}
+
+	// Prepare *after* all nodes are attached/connected. Preparing before attaching txSourceNode
+	// can result in the source node never being pulled on some routes (player still works).
+	ZF_LOGI("Ardop iOS: engine prepare");
+	[engine prepare];
 
 	if (!BuildConverters(outFmt))
 	{
 		ZF_LOGE("Ardop iOS: BuildConverters failed before engine start");
+		if (txSourceNode)
+		{
+			@try
+			{
+				[engine detachNode:txSourceNode];
+			}
+			@catch (__unused NSException *ex)
+			{
+			}
+			txSourceNode = nil;
+		}
 		return false;
 	}
 
@@ -716,6 +969,17 @@ static bool StartEngineIfNeeded(void)
 	if (!InstallRxTap())
 	{
 		ZF_LOGE("Ardop iOS: InstallRxTap failed before engine start");
+		if (txSourceNode)
+		{
+			@try
+			{
+				[engine detachNode:txSourceNode];
+			}
+			@catch (__unused NSException *ex)
+			{
+			}
+			txSourceNode = nil;
+		}
 		return false;
 	}
 
@@ -727,11 +991,23 @@ static bool StartEngineIfNeeded(void)
 		NSLog(@"Ardop iOS: AVAudioEngine start failed: %@", err);
 		ZF_LOGE("Ardop iOS: AVAudioEngine start failed: %s", err.localizedDescription.UTF8String);
 		RemoveRxTap();
+		if (txSourceNode)
+		{
+			@try
+			{
+				[engine detachNode:txSourceNode];
+			}
+			@catch (__unused NSException *ex)
+			{
+			}
+			txSourceNode = nil;
+		}
 		return false;
 	}
-	audio_started = true;
+	ios_engine_running.store(true, std::memory_order_release);
 	NSLog(@"Ardop iOS: AVAudioEngine started ok isRunning=%d tap=%d", (int)engine.isRunning, (int)rx_tap_installed);
 	ZF_LOGI("Ardop iOS: AVAudioEngine started ok");
+	LogAudioSessionRoute("after_engine_start");
 	return true;
 }
 
@@ -743,183 +1019,23 @@ static void StopEngine(void)
 	RemoveRxTap();
 	[player stop];
 	[engine stop];
-	audio_started = false;
-	rxConverter = nil;
-	txConverter = nil;
-	hwInputFormat = nil;
-	hwOutputFormat = nil;
-	ardopFloatMono12k = nil;
-}
-
-static void ScheduleTxDrainIfNeeded(void)
-{
-	if (!TXEnabled || dev_is_nosound(PlaybackDevice))
-		return;
-	if (!audio_started)
-		return;
-
-	// Start player if not running. Must run on main; can throw if disconnected.
-	ardop_run_on_main(^{
-		EnsureEngineObjects();
-		if (!engine || !player)
-			return;
+	ios_engine_running.store(false, std::memory_order_release);
+	if (txSourceNode)
+	{
 		@try
 		{
-			[engine connect:player to:engine.mainMixerNode format:hwOutputFormat];
-			[engine connect:engine.mainMixerNode to:engine.outputNode format:hwOutputFormat];
+			[engine detachNode:txSourceNode];
 		}
 		@catch (__unused NSException *ex)
 		{
 		}
-		if (!player.isPlaying)
-		{
-			@try
-			{
-				[player play];
-			}
-			@catch (NSException *ex)
-			{
-				NSLog(@"Ardop iOS: player play exception (TX): %@", ex);
-			}
-		}
-	});
-}
-
-static void ScheduleTxOneChunk(void)
-{
-	if (!TXEnabled || dev_is_nosound(PlaybackDevice))
-		return;
-	if (!audio_started)
-		return;
-
-	// Pull up to 1200 samples at 12kHz (100ms)
-	int16_t chunk[SendSize];
-	size_t n = tx_ring_pop(chunk, SendSize);
-	if (n == 0)
-		return;
-
-	if (g_dbg_schedule_lines < 30)
-	{
-		char msg[220];
-		snprintf(msg, sizeof(msg),
-			"IOSAUDIO ScheduleTxOneChunk pop n=%zu ring_now=%zu playerPlaying=%d",
-			n, tx_ring_count(), (int)(player && player.isPlaying));
-		TCPSendReplyToHost(msg);
-		g_dbg_schedule_lines++;
+		txSourceNode = nil;
 	}
-
-	// Convert int16 -> float (12k mono) into AVAudioPCMBuffer
-	AVAudioPCMBuffer *ardopBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:ardopFloatMono12k frameCapacity:(AVAudioFrameCount)n];
-	ardopBuf.frameLength = (AVAudioFrameCount)n;
-	float *dst = ardopBuf.floatChannelData[0];
-	for (size_t i = 0; i < n; i++)
-		dst[i] = (float)chunk[i] / 32768.0f;
-
-	// Convert to hardware output format. Size the output buffer tightly so the converter
-	// doesn't request additional input chunks (which can result in 0-frame output with
-	// EndOfStream status when our input block only provides one buffer).
-	const double ratio = hwOutputFormat.sampleRate / kArdopSampleRate;
-	AVAudioFrameCount outCap = (AVAudioFrameCount)lrint((double)n * ratio + 4.0);
-	if (outCap < 1)
-		outCap = 1;
-	AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:hwOutputFormat frameCapacity:outCap];
-	if (!outBuf)
-		return;
-	// Converter writes output frames and sets frameLength.
-	outBuf.frameLength = 0;
-
-	__block bool used = false;
-	AVAudioConverterInputBlock inBlock = ^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus *outStatus) {
-		(void)inNumberOfPackets;
-		if (used)
-		{
-			// Allow converter to stop without treating this as "end of stream"
-			// for subsequent internal pulls.
-			*outStatus = AVAudioConverterInputStatus_NoDataNow;
-			return nil;
-		}
-		used = true;
-		*outStatus = AVAudioConverterInputStatus_HaveData;
-		return ardopBuf;
-	};
-
-	NSError *err = nil;
-	AVAudioConverterOutputStatus st = [txConverter convertToBuffer:outBuf error:&err withInputFromBlock:inBlock];
-	if (st == AVAudioConverterOutputStatus_Error || err)
-	{
-		ZF_LOGW("TX convert error: %s", err.localizedDescription.UTF8String);
-		return;
-	}
-	if (outBuf.frameLength == 0)
-	{
-		// Avoid scheduling empty buffers (silent) and provide a hint for debugging.
-		ZF_LOGW("TX convert produced 0 frames (status=%d)", (int)st);
-		if (g_dbg_schedule_lines < 30)
-		{
-			char msg[220];
-			snprintf(msg, sizeof(msg), "IOSAUDIO TX convert 0 frames status=%d", (int)st);
-			TCPSendReplyToHost(msg);
-			g_dbg_schedule_lines++;
-		}
-		return;
-	}
-
-	// AVAudioConverter may not upmix mono source to stereo hardware buffers; duplicate ch0.
-	if (!outBuf.format.isInterleaved && outBuf.format.channelCount >= 2)
-	{
-		float *ch0 = outBuf.floatChannelData[0];
-		float *ch1 = outBuf.floatChannelData[1];
-		if (ch0 && ch1 && outBuf.frameLength > 0)
-			memcpy(ch1, ch0, (size_t)outBuf.frameLength * sizeof(float));
-	}
-
-	// AVAudioPlayerNode scheduling must happen on main to avoid "disconnected state" crashes.
-	ardop_run_on_main(^{
-		ScheduleTxDrainIfNeeded();
-		@try
-		{
-			[player scheduleBuffer:outBuf completionHandler:^{
-				// Signal SoundFlush waiters when drained
-				pthread_mutex_lock(&tx_mu);
-				if (tx_n == 0)
-					pthread_cond_broadcast(&tx_cv);
-				pthread_mutex_unlock(&tx_mu);
-			}];
-		}
-		@catch (NSException *ex)
-		{
-			NSLog(@"Ardop iOS: scheduleBuffer exception (TX): %@", ex);
-		}
-	});
-
-	if (g_dbg_schedule_lines < 30)
-	{
-		char msg[220];
-		snprintf(msg, sizeof(msg),
-			"IOSAUDIO ScheduleTxOneChunk scheduled outFrames=%u playerPlaying=%d",
-			(unsigned int)outBuf.frameLength, (int)(player && player.isPlaying));
-		TCPSendReplyToHost(msg);
-		g_dbg_schedule_lines++;
-	}
-}
-
-// Background scheduler: schedules TX chunks while there is data queued.
-static void tx_schedule_pump(void)
-{
-	dispatch_async(txScheduleQueue, ^{
-		if (!tx_player_active)
-			return;
-		while (tx_player_active && !tx_stopping)
-		{
-			if (tx_ring_count() == 0)
-			{
-				// Wait a bit for more data or stop
-				usleep(2000);
-				continue;
-			}
-			ScheduleTxOneChunk();
-		}
-	});
+	ios_tx_ring_reset_all();
+	rxConverter = nil;
+	hwInputFormat = nil;
+	hwOutputFormat = nil;
+	ardopFloatMono12k = nil;
 }
 
 // ---- audio.h API ---------------------------------------------------------
@@ -1007,7 +1123,7 @@ extern "C" void CloseSoundCapture(bool do_getdevices)
 		// Removing the tap while the engine is running can stall; if playback is
 		// still active, leave the tap installed (callback returns immediately when
 		// RXEnabled is false).
-		if (!audio_started || !TXEnabled)
+		if (!ios_engine_running.load(std::memory_order_acquire) || !TXEnabled)
 			RemoveRxTap();
 		else
 			NSLog(@"Ardop iOS: CloseSoundCapture leaving input tap (TX still active)");
@@ -1026,11 +1142,12 @@ extern "C" void CloseSoundCapture(bool do_getdevices)
 extern "C" bool OpenSoundPlayback(char *devstr, int ch)
 {
 	(void)ch;
-	NSLog(@"Ardop iOS: OpenSoundPlayback entry devstr=\"%s\" TXEnabled=%d PlaybackDevice=\"%s\"",
+	NSLog(@"Ardop iOS: OpenSoundPlayback entry devstr=\"%s\" prior TXEnabled=%d prior PlaybackDevice=\"%s\"",
 		devstr ? devstr : "(null)", (int)TXEnabled, PlaybackDevice[0] ? PlaybackDevice : "NONE");
 	{
-		char msg[240];
-		snprintf(msg, sizeof(msg), "IOSAUDIO OpenSoundPlayback(entry) devstr=\"%s\" TXEnabled=%d PlaybackDevice=\"%s\"",
+		char msg[280];
+		snprintf(msg, sizeof(msg),
+			"IOSAUDIO OpenSoundPlayback(entry) devstr=\"%s\" prior_TXEnabled=%d prior_PlaybackDevice=\"%s\"",
 			devstr ? devstr : "(null)", (int)TXEnabled, PlaybackDevice[0] ? PlaybackDevice : "NONE");
 		TCPSendReplyToHost(msg);
 	}
@@ -1146,35 +1263,72 @@ extern "C" bool SendtoCard(int n)
 		return false;
 	if (dev_is_nosound(PlaybackDevice))
 		return true;
+	if (!ios_engine_running.load(std::memory_order_acquire))
+	{
+		ZF_LOGW("SendtoCard: AVAudioEngine not started");
+		return false;
+	}
 
 	if (g_dbg_sendtocard_lines < 20)
 	{
-		char msg[220];
+		char msg[320];
 		snprintf(msg, sizeof(msg),
-			"IOSAUDIO SendtoCard n=%d TxIndex=%d TXEnabled=%d pb=\"%s\" ring_before=%zu",
-			n, TxIndex, (int)TXEnabled, PlaybackDevice[0] ? PlaybackDevice : "NONE", tx_ring_count());
+			"IOSAUDIO SendtoCard n=%d TxIndex=%d TXEnabled=%d pb=\"%s\" ring_before=%d pending=%llu "
+			"render_calls=%llu nonzero=%llu last_i16=%d",
+			n, TxIndex, (int)TXEnabled, PlaybackDevice[0] ? PlaybackDevice : "NONE",
+			(int)ios_ringbuf_count.load(std::memory_order_relaxed),
+			(unsigned long long)ios_tx_samples_pending(),
+			(unsigned long long)ios_tx_render_calls.load(std::memory_order_relaxed),
+			(unsigned long long)ios_tx_render_nonzero_frames.load(std::memory_order_relaxed),
+			(int)ios_tx_last_sample_i16.load(std::memory_order_relaxed));
 		TCPSendReplyToHost(msg);
 		g_dbg_sendtocard_lines++;
 	}
 
-	// Enqueue n samples from txbuffer[TxIndex] into TX ring
-	size_t pushed = tx_ring_push((const int16_t *)&txbuffer[TxIndex][0], (size_t)n);
-	if (pushed == 0)
+	const bool resetCounters = (ios_tx_samples_pending() == 0);
+	if (resetCounters)
+		ios_tx_reset_counters();
+
+	int written = 0;
+	for (int i = 0; i < n; i++)
+	{
+		if (ios_ringbuf_count.load(std::memory_order_acquire) >= IOS_TX_RINGBUF_SIZE)
+		{
+			ZF_LOGE("SendtoCard: TX ring buffer overrun; dropping remainder");
+			break;
+		}
+		ios_tx_ringbuf[ios_ringbuf_write] = txbuffer[TxIndex][i];
+		ios_ringbuf_write = (ios_ringbuf_write + 1) % IOS_TX_RINGBUF_SIZE;
+		ios_ringbuf_count.fetch_add(1, std::memory_order_release);
+		written++;
+	}
+	ios_txSamplesQueued += (uint64_t)written;
+
+	if (written == 0)
 		ZF_LOGW("iOS TX ring full; dropping samples");
 	else if (g_dbg_sendtocard_lines < 20)
 	{
-		char msg[220];
-		snprintf(msg, sizeof(msg), "IOSAUDIO SendtoCard pushed=%zu ring_after=%zu", pushed, tx_ring_count());
+		char msg[320];
+		snprintf(msg, sizeof(msg),
+			"IOSAUDIO SendtoCard written=%d ring_after=%d pending=%llu render_calls=%llu nonzero=%llu last_i16=%d",
+			written,
+			(int)ios_ringbuf_count.load(std::memory_order_relaxed),
+			(unsigned long long)ios_tx_samples_pending(),
+			(unsigned long long)ios_tx_render_calls.load(std::memory_order_relaxed),
+			(unsigned long long)ios_tx_render_nonzero_frames.load(std::memory_order_relaxed),
+			(int)ios_tx_last_sample_i16.load(std::memory_order_relaxed));
 		TCPSendReplyToHost(msg);
 		g_dbg_sendtocard_lines++;
 	}
 
-	// Ensure scheduling pump is running
-	if (!tx_player_active)
+	if (!ios_audioPlaying.load(std::memory_order_acquire) && written > 0)
 	{
-		tx_player_active = true;
-		tx_stopping = false;
-		tx_schedule_pump();
+		// Publish ring/counter writes before the render thread observes "playing".
+		std::atomic_thread_fence(std::memory_order_release);
+		ios_audioPlaying.store(true, std::memory_order_release);
+		ios_audioFinished.store(false, std::memory_order_release);
+		ios_srcPosition = 0.0f;
+		SoundIsPlaying = true;
 	}
 	return true;
 }
@@ -1203,13 +1357,47 @@ extern "C" bool SoundFlush(void)
 	if (TXEnabled && AddTrailer() && SendtoCard(Number))
 		txlenMs = SampleNo / 12 + 20;
 
-	// Wait for ring to drain, bounded.
-	unsigned int start = Now;
-	unsigned int maxWait = 5000U + (unsigned int)(txlenMs + 200);
-	pthread_mutex_lock(&tx_mu);
-	while (tx_n > 0 && (Now - start) < maxWait)
-		pthread_cond_wait(&tx_cv, &tx_mu);
-	pthread_mutex_unlock(&tx_mu);
+	const bool wantDrain = TXEnabled && !dev_is_nosound(PlaybackDevice) &&
+		ios_engine_running.load(std::memory_order_acquire) && ios_audioPlaying;
+
+	if (wantDrain)
+	{
+		uint64_t initialPending = ios_tx_samples_pending();
+		const int ringcnt = ios_ringbuf_count.load(std::memory_order_acquire);
+		if ((uint64_t)ringcnt > initialPending)
+			initialPending = (uint64_t)ringcnt;
+
+		unsigned int waitStart = Now;
+		unsigned int allowedWaitMs = 500U;
+		if (initialPending > 0)
+		{
+			unsigned int pendingMs = (unsigned int)((initialPending * 1000ULL) / 12000ULL);
+			unsigned int dynamic = 500U + pendingMs + 100U;
+			if (dynamic > 5000U)
+				dynamic = 5000U;
+			allowedWaitMs = dynamic;
+		}
+		unsigned int minWait = 5000U + (unsigned int)txlenMs + 200U;
+		if (allowedWaitMs < minWait)
+			allowedWaitMs = minWait;
+		if (allowedWaitMs > 30000U)
+			allowedWaitMs = 30000U;
+
+		while ((ios_tx_samples_pending() > 0 || ios_ringbuf_count.load(std::memory_order_acquire) > 0) &&
+		       !ios_audioFinished.load(std::memory_order_acquire))
+		{
+			usleep(1000);
+			unsigned int now = Now;
+			if (now - waitStart > allowedWaitMs)
+			{
+				ZF_LOGW("SoundFlush: timeout waiting for TX buffer to drain (%llu pending samples)",
+					(unsigned long long)ios_tx_samples_pending());
+				break;
+			}
+		}
+
+		ios_tx_ring_reset_all();
+	}
 
 	SoundIsPlaying = false;
 	if (blnEnbARQRpt > 0 || blnDISCRepeating)
@@ -1222,15 +1410,6 @@ extern "C" bool SoundFlush(void)
 		CloseWav(txwff);
 		txwff = NULL;
 	}
-
-	// Stop scheduling when drained.
-	pthread_mutex_lock(&tx_mu);
-	tx_player_active = false;
-	tx_stopping = true;
-	pthread_cond_broadcast(&tx_cv);
-	pthread_mutex_unlock(&tx_mu);
-
-	tx_ring_reset();
 
 	StartCaptureInternal();
 
