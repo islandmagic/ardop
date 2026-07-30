@@ -192,6 +192,7 @@ enum _ProtocolMode ProtocolMode = FEC;
 
 extern bool blnEnbARQRpt;
 extern bool blnDISCRepeating;
+extern bool blnARQConnected;
 extern StationId ARQStationRemote;  // current connection remote callsign
 extern StationId ARQStationLocal;   // current connection local callsign
 extern StationId ARQStationFinalId; // post-session local IDF to send
@@ -643,6 +644,17 @@ void ardopmain() {
 
 	blnTimeoutTriggered = false;
 	DecodeCompleteTime = Now;
+	// Embedded stop/start re-enters ardopmain() with ProtocolState already DISC,
+	// so SetARDOPProtocolState(DISC) would no-op and leave session flags dirty.
+	// Always reset connection state for a clean session.
+	InitializeConnection();
+	blnEnbARQRpt = false;
+	blnDISCRepeating = false;
+	blnARQConnected = false;
+	blnPending = false;
+	ClearDataToSend();
+	if (ProtocolState == DISC)
+		ProtocolState = IDLE;  // force DISC case below to run
 	SetARDOPProtocolState(DISC);
 
 	TCPHostInit();

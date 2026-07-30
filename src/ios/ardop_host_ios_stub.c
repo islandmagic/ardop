@@ -315,3 +315,20 @@ void ardop_host_wake(void)
 {
 	host_evt_signal();
 }
+
+void ardop_host_reset(void)
+{
+	pthread_mutex_lock(&host_text_mu);
+	host_text_r = 0;
+	host_text_w = 0;
+	host_text_n = 0;
+	pthread_mutex_unlock(&host_text_mu);
+
+	pthread_mutex_lock(&host_data_mu);
+	host_data_r = 0;
+	host_data_w = 0;
+	host_data_n = 0;
+	pthread_mutex_unlock(&host_data_mu);
+
+	host_evt_signal();
+}

@@ -1354,6 +1354,11 @@ extern "C" bool OpenSoundCapture(char *devstr, int ch)
 	{
 		ZF_LOGI("Ardop iOS: OpenSoundCapture \"%s\" (external audio, no engine)", devstr);
 		rx_thread_start_if_needed();
+		// Mirror Linux ALSA: enable decode immediately when not transmitting.
+		// Without this, Capturing stays false until after the first TX, so cold
+		// listen never decodes ConReq.
+		if (!SoundIsPlaying)
+			StartCaptureInternal();
 		updateWebGuiAudioConfig(true);
 		return true;
 	}
@@ -1367,14 +1372,18 @@ extern "C" bool OpenSoundCapture(char *devstr, int ch)
 	});
 	ZF_LOGI("Ardop iOS: OpenSoundCapture -> %s", ok ? "OK" : "FAIL");
 	if (ok)
+	{
 		rx_thread_start_if_needed();
-	NSLog(@"Ardop iOS: OpenSoundCapture exit ok=%d RXEnabled=%d CaptureDevice=\"%s\"",
-		(int)ok, (int)RXEnabled, CaptureDevice[0] ? CaptureDevice : "NONE");
+		if (!SoundIsPlaying)
+			StartCaptureInternal();
+	}
+	NSLog(@"Ardop iOS: OpenSoundCapture exit ok=%d RXEnabled=%d Capturing=%d CaptureDevice=\"%s\"",
+		(int)ok, (int)RXEnabled, (int)Capturing, CaptureDevice[0] ? CaptureDevice : "NONE");
 	{
 		char msg[240];
 		snprintf(msg, sizeof(msg),
-			"IOSAUDIO OpenSoundCapture(exit) ok=%d RXEnabled=%d CaptureDevice=\"%s\"",
-			(int)ok, (int)RXEnabled, CaptureDevice[0] ? CaptureDevice : "NONE");
+			"IOSAUDIO OpenSoundCapture(exit) ok=%d RXEnabled=%d Capturing=%d CaptureDevice=\"%s\"",
+			(int)ok, (int)RXEnabled, (int)Capturing, CaptureDevice[0] ? CaptureDevice : "NONE");
 		TCPSendReplyToHost(msg);
 	}
 

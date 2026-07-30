@@ -18,6 +18,14 @@ extern "C" {
 }
 
 extern "C" bool blnClosing;
+extern "C" bool SoundIsPlaying;
+extern "C" bool Capturing;
+extern "C" bool blnEnbARQRpt;
+extern "C" bool blnDISCRepeating;
+extern "C" bool KeyPTT(bool State);
+extern "C" void CloseSoundCapture(bool do_getdevices);
+extern "C" void CloseSoundPlayback(bool do_getdevices);
+extern "C" void InitializeConnection(void);
 
 // External audio hooks implemented in IOSAudioEngine.mm.
 typedef void (*ardop_external_tx_fn)(const short *pcm48k, size_t count, void *ctx);
@@ -223,6 +231,18 @@ static void *ardopkit_pump_main(void *ctx)
 
 	if (_pumpRunning)
 		pthread_join(_pumpThread, NULL);
+
+	// Full teardown so the next start() does not inherit stuck TX/RX flags,
+	// a live RX thread, repeat machinery, or stale host queue lines.
+	(void)KeyPTT(false);
+	SoundIsPlaying = false;
+	Capturing = false;
+	blnEnbARQRpt = false;
+	blnDISCRepeating = false;
+	CloseSoundCapture(false);
+	CloseSoundPlayback(false);
+	InitializeConnection();
+	ardop_host_reset();
 
 	pthread_mutex_lock(&_mu);
 	_workerRunning = false;

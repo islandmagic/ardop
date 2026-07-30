@@ -60,6 +60,10 @@ int ardop_host_wait_event(uint32_t timeout_ms);
 // Wake any threads blocked in ardop_host_wait_event().
 void ardop_host_wake(void);
 
+// Clear outbound text/data queues so a subsequent start() does not deliver
+// stale CONNECTED / DISCONNECTED / PTT lines to a new session.
+void ardop_host_reset(void);
+
 #ifdef __cplusplus
 }
 #endif
