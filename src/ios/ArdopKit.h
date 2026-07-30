@@ -50,6 +50,18 @@ typedef NS_ENUM(NSInteger, ArdopKitRunState) {
 - (void)ardopKit:(ArdopKit *)kit didReceiveDataMessage:(ArdopKitDataMessage *)message;
 @end
 
+// External audio sink for network rigs (e.g. ICOM Wi-Fi). When external audio is
+// enabled the modem never touches AVAudioSession/AVAudioEngine; TX audio is handed
+// to the sink and RX audio must be fed via -feedExternalReceivedAudio:.
+@protocol ArdopKitExternalAudioSink <NSObject>
+// Modem TX audio, PCM 16-bit LE mono 48 kHz. Called from the modem thread; must not
+// block. The sink should pace delivery to the rig in real time.
+- (void)ardopKit:(ArdopKit *)kit transmitAudio:(NSData *)pcm48k;
+// Return YES once all TX audio previously handed over has fully played out at the
+// rig. Polled from the modem thread after each transmission to time PTT release.
+- (BOOL)ardopKitIsTransmitAudioDrained:(ArdopKit *)kit;
+@end
+
 @interface ArdopKit : NSObject
 
 @property (nonatomic, weak, nullable) id<ArdopKitDelegate> delegate;
@@ -72,6 +84,14 @@ typedef NS_ENUM(NSInteger, ArdopKitRunState) {
 - (BOOL)setGridSquare:(NSString *)grid;
 // Convenience: start-of-session typical init sequence.
 - (BOOL)initializeModem;
+
+// --- External audio (network rig) ---
+// Enable before submitting PLAYBACK/CAPTURE commands. The sink is retained until
+// -disableExternalAudio.
+- (void)enableExternalAudioWithSink:(id<ArdopKitExternalAudioSink>)sink;
+- (void)disableExternalAudio;
+// Feed rig RX audio: PCM 16-bit LE mono 48 kHz. Call serially (one queue).
+- (void)feedExternalReceivedAudio:(NSData *)pcm48k;
 
 @end
 

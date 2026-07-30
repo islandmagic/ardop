@@ -19,6 +19,44 @@ extern "C" {
 
 extern "C" bool blnClosing;
 
+// External audio hooks implemented in IOSAudioEngine.mm.
+typedef void (*ardop_external_tx_fn)(const short *pcm48k, size_t count, void *ctx);
+typedef bool (*ardop_external_tx_drained_fn)(void *ctx);
+extern "C" void ArdopSetExternalAudio(ardop_external_tx_fn tx, ardop_external_tx_drained_fn drained, void *ctx);
+extern "C" void ArdopClearExternalAudio(void);
+extern "C" void ArdopExternalAudioFeedRx(const short *pcm48k, size_t count);
+
+// One external sink at a time (ArdopKit is effectively a singleton around ardopmain()).
+static ArdopKit *g_externalAudioKit = nil;
+static id<ArdopKitExternalAudioSink> g_externalAudioSink = nil;
+
+static void ardopkit_external_tx_trampoline(const short *pcm48k, size_t count, void *ctx)
+{
+	(void)ctx;
+	id<ArdopKitExternalAudioSink> sink = g_externalAudioSink;
+	ArdopKit *kit = g_externalAudioKit;
+	if (sink == nil || kit == nil || pcm48k == NULL || count == 0)
+		return;
+	@autoreleasepool {
+		NSData *data = [NSData dataWithBytes:pcm48k length:count * sizeof(short)];
+		[sink ardopKit:kit transmitAudio:data];
+	}
+}
+
+static bool ardopkit_external_tx_drained_trampoline(void *ctx)
+{
+	(void)ctx;
+	id<ArdopKitExternalAudioSink> sink = g_externalAudioSink;
+	ArdopKit *kit = g_externalAudioKit;
+	if (sink == nil || kit == nil)
+		return true;
+	bool drained = true;
+	@autoreleasepool {
+		drained = [sink ardopKitIsTransmitAudioDrained:kit];
+	}
+	return drained;
+}
+
 @interface ArdopKit ()
 {
 	pthread_t _workerThread;
@@ -297,6 +335,27 @@ static void *ardopkit_pump_main(void *ctx)
 - (BOOL)initializeModem
 {
 	return [self submitCommand:@"INITIALIZE"];
+}
+
+- (void)enableExternalAudioWithSink:(id<ArdopKitExternalAudioSink>)sink
+{
+	g_externalAudioKit = self;
+	g_externalAudioSink = sink;
+	ArdopSetExternalAudio(ardopkit_external_tx_trampoline, ardopkit_external_tx_drained_trampoline, NULL);
+}
+
+- (void)disableExternalAudio
+{
+	ArdopClearExternalAudio();
+	g_externalAudioSink = nil;
+	g_externalAudioKit = nil;
+}
+
+- (void)feedExternalReceivedAudio:(NSData *)pcm48k
+{
+	if (pcm48k.length < sizeof(short))
+		return;
+	ArdopExternalAudioFeedRx((const short *)pcm48k.bytes, pcm48k.length / sizeof(short));
 }
 
 @end

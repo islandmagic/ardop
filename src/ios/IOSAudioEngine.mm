@@ -92,6 +92,112 @@ static std::atomic<uint64_t> ios_tx_render_frames{0};
 static std::atomic<uint64_t> ios_tx_render_nonzero_frames{0};
 static std::atomic<int> ios_tx_last_sample_i16{0};
 
+// ---- External audio mode (network rig, e.g. ICOM Wi-Fi) --------------------
+// When enabled, no AVAudioSession / AVAudioEngine is touched. TX audio is handed
+// to the host app as PCM16 mono 48 kHz (upsampled from the modem's 12 kHz domain)
+// and RX audio is fed back by the host at 48 kHz (decimated to 12 kHz here).
+typedef void (*ardop_external_tx_fn)(const short *pcm48k, size_t count, void *ctx);
+typedef bool (*ardop_external_tx_drained_fn)(void *ctx);
+
+static std::atomic<bool> g_external_audio_enabled{false};
+static ardop_external_tx_fn g_external_tx = NULL;
+static ardop_external_tx_drained_fn g_external_tx_drained = NULL;
+static void *g_external_ctx = NULL;
+
+// Linear-interpolation upsample carry (last 12 kHz sample of the previous block).
+static short g_ext_tx_last_sample = 0;
+static bool g_ext_tx_has_last_sample = false;
+// 48 kHz → 12 kHz boxcar decimation carry (partial group of 4 samples).
+static int g_ext_rx_carry_sum = 0;
+static int g_ext_rx_carry_count = 0;
+
+static inline bool ios_external_audio_active(void)
+{
+	return g_external_audio_enabled.load(std::memory_order_acquire);
+}
+
+extern "C" void ArdopSetExternalAudio(ardop_external_tx_fn tx, ardop_external_tx_drained_fn drained, void *ctx)
+{
+	g_external_tx = tx;
+	g_external_tx_drained = drained;
+	g_external_ctx = ctx;
+	g_ext_tx_last_sample = 0;
+	g_ext_tx_has_last_sample = false;
+	g_ext_rx_carry_sum = 0;
+	g_ext_rx_carry_count = 0;
+	g_external_audio_enabled.store(tx != NULL, std::memory_order_release);
+	ZF_LOGI("Ardop iOS: external audio %s", tx != NULL ? "enabled" : "disabled");
+}
+
+extern "C" void ArdopClearExternalAudio(void)
+{
+	g_external_audio_enabled.store(false, std::memory_order_release);
+	g_external_tx = NULL;
+	g_external_tx_drained = NULL;
+	g_external_ctx = NULL;
+	ZF_LOGI("Ardop iOS: external audio cleared");
+}
+
+static size_t rx_ring_push(const int16_t *in, size_t n);
+
+// Host app feeds rig RX audio (PCM16 mono 48 kHz). Decimates by 4 with a boxcar
+// average — the rig passband is ≤ ~3 kHz so this is adequate anti-aliasing —
+// and pushes into the same 12 kHz RX ring the tap path uses. Must be called
+// from a single (serial) context.
+extern "C" void ArdopExternalAudioFeedRx(const short *pcm48k, size_t count)
+{
+	if (!ios_external_audio_active() || pcm48k == NULL || count == 0)
+		return;
+
+	int16_t out[1024];
+	size_t outn = 0;
+	for (size_t i = 0; i < count; i++)
+	{
+		g_ext_rx_carry_sum += pcm48k[i];
+		if (++g_ext_rx_carry_count == 4)
+		{
+			out[outn++] = (int16_t)(g_ext_rx_carry_sum / 4);
+			g_ext_rx_carry_sum = 0;
+			g_ext_rx_carry_count = 0;
+			if (outn == sizeof(out) / sizeof(out[0]))
+			{
+				(void)rx_ring_push(out, outn);
+				outn = 0;
+			}
+		}
+	}
+	if (outn > 0)
+		(void)rx_ring_push(out, outn);
+}
+
+// Upsample one 12 kHz block ×4 (linear interpolation) and hand it to the host sink.
+static bool ios_external_sendtocard(const short *samples12k, int n)
+{
+	ardop_external_tx_fn tx = g_external_tx;
+	if (tx == NULL || samples12k == NULL || n <= 0)
+		return false;
+
+	static short out48k[SendSize * 4];
+	if (n > SendSize)
+		n = SendSize;
+
+	short prev = g_ext_tx_has_last_sample ? g_ext_tx_last_sample : samples12k[0];
+	size_t outn = 0;
+	for (int i = 0; i < n; i++)
+	{
+		short cur = samples12k[i];
+		for (int k = 1; k <= 4; k++)
+			out48k[outn++] = (short)(prev + ((int)(cur - prev) * k) / 4);
+		prev = cur;
+	}
+	g_ext_tx_last_sample = prev;
+	g_ext_tx_has_last_sample = true;
+
+	tx(out48k, outn, g_external_ctx);
+	SoundIsPlaying = true;
+	return true;
+}
+
 static inline uint64_t ios_tx_samples_pending(void)
 {
 	uint64_t queued = ios_txSamplesQueued;
@@ -1072,11 +1178,14 @@ extern "C" void GetDevices(void)
 extern "C" void InitAudio(bool quiet)
 {
 	(void)quiet;
-	ardop_run_on_main(^{
-		EnsureEngineObjects();
-		if (!ConfigureSession())
-			ZF_LOGE("InitAudio: ConfigureSession failed");
-	});
+	if (!ios_external_audio_active())
+	{
+		ardop_run_on_main(^{
+			EnsureEngineObjects();
+			if (!ConfigureSession())
+				ZF_LOGE("InitAudio: ConfigureSession failed");
+		});
+	}
 	GetDevices();
 	AudioInit = true;
 }
@@ -1118,6 +1227,11 @@ extern "C" void CloseSoundCapture(bool do_getdevices)
 	RXEnabled = false;
 	CaptureDevice[0] = '\0';
 	rx_thread_stop_if_running();
+	if (ios_external_audio_active())
+	{
+		NSLog(@"Ardop iOS: CloseSoundCapture (external audio, no engine)");
+		return;
+	}
 	ardop_run_on_main(^{
 		EnsureEngineObjects();
 		// Removing the tap while the engine is running can stall; if playback is
@@ -1175,6 +1289,13 @@ extern "C" bool OpenSoundPlayback(char *devstr, int ch)
 	strncpy(PlaybackDevice, devstr, DEVSTRSZ - 1);
 	PlaybackDevice[DEVSTRSZ - 1] = '\0';
 
+	if (ios_external_audio_active())
+	{
+		ZF_LOGI("Ardop iOS: OpenSoundPlayback \"%s\" (external audio, no engine)", devstr);
+		updateWebGuiAudioConfig(true);
+		return true;
+	}
+
 	ZF_LOGI("Ardop iOS: OpenSoundPlayback \"%s\" ch=%d", devstr, ch);
 	__block bool ok = true;
 	ardop_run_on_main(^{
@@ -1229,6 +1350,14 @@ extern "C" bool OpenSoundCapture(char *devstr, int ch)
 	strncpy(CaptureDevice, devstr, DEVSTRSZ - 1);
 	CaptureDevice[DEVSTRSZ - 1] = '\0';
 
+	if (ios_external_audio_active())
+	{
+		ZF_LOGI("Ardop iOS: OpenSoundCapture \"%s\" (external audio, no engine)", devstr);
+		rx_thread_start_if_needed();
+		updateWebGuiAudioConfig(true);
+		return true;
+	}
+
 	ZF_LOGI("Ardop iOS: OpenSoundCapture \"%s\" ch=%d", devstr, ch);
 	__block bool ok = true;
 	ardop_run_on_main(^{
@@ -1263,6 +1392,8 @@ extern "C" bool SendtoCard(int n)
 		return false;
 	if (dev_is_nosound(PlaybackDevice))
 		return true;
+	if (ios_external_audio_active())
+		return ios_external_sendtocard(&txbuffer[TxIndex][0], n);
 	if (!ios_engine_running.load(std::memory_order_acquire))
 	{
 		ZF_LOGW("SendtoCard: AVAudioEngine not started");
@@ -1356,6 +1487,51 @@ extern "C" bool SoundFlush(void)
 	int txlenMs = 0;
 	if (TXEnabled && AddTrailer() && SendtoCard(Number))
 		txlenMs = SampleNo / 12 + 20;
+
+	if (ios_external_audio_active())
+	{
+		// Wait for the external sink (network rig pacer) to report the TX audio
+		// fully played out before dropping PTT — mirrors the engine drain below.
+		if (TXEnabled && !dev_is_nosound(PlaybackDevice) && g_external_tx_drained != NULL)
+		{
+			unsigned int waitStart = Now;
+			unsigned int allowedWaitMs = 5000U + (unsigned int)txlenMs + 200U;
+			if (allowedWaitMs > 30000U)
+				allowedWaitMs = 30000U;
+			while (!g_external_tx_drained(g_external_ctx))
+			{
+				usleep(5000);
+				unsigned int now = Now;
+				if (now - waitStart > allowedWaitMs)
+				{
+					ZF_LOGW("SoundFlush: timeout waiting for external TX audio to drain");
+					break;
+				}
+			}
+			// Small tail so the rig finishes its buffered frames before PTT drops.
+			usleep(60000);
+		}
+		g_ext_tx_has_last_sample = false;
+
+		SoundIsPlaying = false;
+		if (blnEnbARQRpt > 0 || blnDISCRepeating)
+			dttNextPlay = Now + intFrameRepeatInterval + extraDelay;
+
+		KeyPTT(false);
+
+		if (txwff != NULL)
+		{
+			CloseWav(txwff);
+			txwff = NULL;
+		}
+
+		StartCaptureInternal();
+
+		if (WriteRxWav && !HWriteRxWav)
+			StartRxWav();
+
+		return TXEnabled;
+	}
 
 	const bool wantDrain = TXEnabled && !dev_is_nosound(PlaybackDevice) &&
 		ios_engine_running.load(std::memory_order_acquire) && ios_audioPlaying;
