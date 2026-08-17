@@ -232,6 +232,11 @@ static void *ardopkit_pump_main(void *ctx)
 	if (_pumpRunning)
 		pthread_join(_pumpThread, NULL);
 
+	// Worker is gone — safe to drop C function pointers used by SoundFlush.
+	ArdopClearExternalAudio();
+	g_externalAudioSink = nil;
+	g_externalAudioKit = nil;
+
 	// Full teardown so the next start() does not inherit stuck TX/RX flags,
 	// a live RX thread, repeat machinery, or stale host queue lines.
 	(void)KeyPTT(false);
@@ -366,9 +371,17 @@ static void *ardopkit_pump_main(void *ctx)
 
 - (void)disableExternalAudio
 {
-	ArdopClearExternalAudio();
+	// Drop the ObjC sink first so in-flight trampolines become no-ops / report
+	// drained. Do not clear C function pointers while the worker may still be in
+	// SoundFlush — ArdopClearExternalAudio runs in -stop after pthread_join.
 	g_externalAudioSink = nil;
 	g_externalAudioKit = nil;
+
+	pthread_mutex_lock(&_mu);
+	bool running = _workerRunning;
+	pthread_mutex_unlock(&_mu);
+	if (!running)
+		ArdopClearExternalAudio();
 }
 
 - (void)feedExternalReceivedAudio:(NSData *)pcm48k

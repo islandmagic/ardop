@@ -1501,14 +1501,22 @@ extern "C" bool SoundFlush(void)
 	{
 		// Wait for the external sink (network rig pacer) to report the TX audio
 		// fully played out before dropping PTT — mirrors the engine drain below.
-		if (TXEnabled && !dev_is_nosound(PlaybackDevice) && g_external_tx_drained != NULL)
+		// Re-load the drained callback each iteration: teardown may clear it while
+		// we wait (cancel during ConReq). Treat NULL / disabled as drained.
+		if (TXEnabled && !dev_is_nosound(PlaybackDevice))
 		{
 			unsigned int waitStart = Now;
 			unsigned int allowedWaitMs = 5000U + (unsigned int)txlenMs + 200U;
 			if (allowedWaitMs > 30000U)
 				allowedWaitMs = 30000U;
-			while (!g_external_tx_drained(g_external_ctx))
+			for (;;)
 			{
+				ardop_external_tx_drained_fn drained = g_external_tx_drained;
+				void *ctx = g_external_ctx;
+				if (drained == NULL || !ios_external_audio_active())
+					break;
+				if (drained(ctx))
+					break;
 				usleep(5000);
 				unsigned int now = Now;
 				if (now - waitStart > allowedWaitMs)
