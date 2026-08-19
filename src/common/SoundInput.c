@@ -86,7 +86,8 @@ int	intPriorMixedSamplesLength = 120;  // size of Prior sample buffer
 short rawSamples[2400];  // Get Frame Type need 2400 and we may add 1200
 int rawSamplesLength = 0;
 
-short intFilteredMixedSamples[5000];  // Get Frame Type need 2400 and we may add 1200
+#define FILTERED_MIXED_SAMPLES_LEN 5000
+short intFilteredMixedSamples[FILTERED_MIXED_SAMPLES_LEN];  // Get Frame Type need 2400 and we may add 1200
 int intFilteredMixedSamplesLength = 0;
 
 int intFrameType;  // Type we are decoding
@@ -386,6 +387,31 @@ void ClearAllMixedSamples()
 	rawSamplesLength = 0;  // Clear saved
 }
 
+// Compact intFilteredMixedSamples so remaining samples start at index 0.
+// Returns false (and resets demod state) if length/start are out of range —
+// never memmove a negative or oversized count (Apple _FORTIFY_SOURCE aborts).
+static bool compactFilteredMixedSamples(int start, const char *where)
+{
+	if (start < 0
+		|| start > FILTERED_MIXED_SAMPLES_LEN
+		|| intFilteredMixedSamplesLength < 0
+		|| intFilteredMixedSamplesLength > FILTERED_MIXED_SAMPLES_LEN - start)
+	{
+		ZF_LOGE(
+			"Corrupt intFilteredMixedSamplesLength (%d) start=%d at %s.",
+			intFilteredMixedSamplesLength, start, where);
+		ClearAllMixedSamples();
+		State = SearchingForLeader;
+		return false;
+	}
+
+	if (intFilteredMixedSamplesLength > 0 && start > 0)
+		memmove(intFilteredMixedSamples,
+			&intFilteredMixedSamples[start],
+			(size_t)intFilteredMixedSamplesLength * 2);
+	return true;
+}
+
 // Function to Initialize mixed samples
 
 void InitializeMixedSamples()
@@ -507,18 +533,19 @@ void FSMixFilter2000Hz(short * intMixedSamples, int intMixedSamplesLength)
 		}
 
 		intFilteredSample = intFilteredSample * 0.00833333333f;
+		if (intFilteredMixedSamplesLength >= FILTERED_MIXED_SAMPLES_LEN)
+		{
+			ZF_LOGE(
+				"Corrupt intFilteredMixedSamplesLength (%d) in FSMixFilter2000Hz().",
+				intFilteredMixedSamplesLength);
+			break;
+		}
 		intFilteredMixedSamples[intFilteredMixedSamplesLength++] = intFilteredSample;  // rescales for gain of filter
 	}
 
 	// update the prior intPriorMixedSamples array for the next filter call
 
 	memmove(intPriorMixedSamples, &intMixedSamples[intMixedSamplesLength - xintN], intPriorMixedSamplesLength * 2);
-
-	if (intFilteredMixedSamplesLength > 5000)
-		ZF_LOGE(
-			"Corrupt intFilteredMixedSamplesLength (%d) in FSMixFilter2000Hz().",
-			intFilteredMixedSamplesLength);
-
 }
 
 // Function to apply 75Hz filter used in Envelope correlator
@@ -1148,14 +1175,8 @@ void ProcessNewSamples(short * Samples, int nSamples) {
 
 		intFilteredMixedSamplesLength -= intMFSReadPtr;
 
-		if (intFilteredMixedSamplesLength < 0)
-			ZF_LOGE(
-				"Corrupt intFilteredMixedSamplesLength (%d) at State == AcquireFrameSync.",
-				intFilteredMixedSamplesLength);
-
-
-		memmove(intFilteredMixedSamples,
-			&intFilteredMixedSamples[intMFSReadPtr], intFilteredMixedSamplesLength * 2);
+		if (!compactFilteredMixedSamples(intMFSReadPtr, "AcquireFrameSync"))
+			return;
 
 		intMFSReadPtr = 0;
 
@@ -1210,13 +1231,8 @@ void ProcessNewSamples(short * Samples, int nSamples) {
 
 			intFilteredMixedSamplesLength -= intMFSReadPtr;
 
-			if (intFilteredMixedSamplesLength < 0)
-				ZF_LOGE(
-					"Corrupt intFilteredMixedSamplesLength (%d) at State == AcquireFrameTypeType.",
-					intFilteredMixedSamplesLength);
-
-			memmove(intFilteredMixedSamples,
-				&intFilteredMixedSamples[intMFSReadPtr], intFilteredMixedSamplesLength * 2);
+			if (!compactFilteredMixedSamples(intMFSReadPtr, "AcquireFrameType"))
+				return;
 
 			intMFSReadPtr = 0;
 
@@ -2655,14 +2671,8 @@ bool Demod1Car4FSK()
 
 			// (while checking process - will use cyclic buffer eventually
 
-			if (intFilteredMixedSamplesLength < 0)
-				ZF_LOGE(
-					"Corrupt intFilteredMixedSamplesLength (%d) in Demod1Car4FSK().",
-					intFilteredMixedSamplesLength);
-
-			if (intFilteredMixedSamplesLength > 0)
-				memmove(intFilteredMixedSamples,
-					&intFilteredMixedSamples[Start], intFilteredMixedSamplesLength * 2);
+			if (!compactFilteredMixedSamples(Start, "Demod1Car4FSK"))
+				return false;
 
 			return false;  // Wait for more samples
 		}
@@ -2964,14 +2974,8 @@ bool Demod1Car4FSK600()
 
 			// (while checking process - will use cyclic buffer eventually
 
-			if (intFilteredMixedSamplesLength < 0)
-				ZF_LOGE(
-					"Corrupt intFilteredMixedSamplesLength (%d) in Demod1Car4FSK600().",
-					intFilteredMixedSamplesLength);
-
-			if (intFilteredMixedSamplesLength > 0)
-				memmove(intFilteredMixedSamples,
-					&intFilteredMixedSamples[Start], intFilteredMixedSamplesLength * 2);
+			if (!compactFilteredMixedSamples(Start, "Demod1Car4FSK600"))
+				return false;
 
 			return false;
 		}
@@ -4807,9 +4811,8 @@ void DemodPSK()
 
 			// (while checking process - will use cyclic buffer eventually
 
-			if (intFilteredMixedSamplesLength > 0 && Start > 0)
-				memmove(intFilteredMixedSamples,
-					&intFilteredMixedSamples[Start], intFilteredMixedSamplesLength * 2);
+			if (!compactFilteredMixedSamples(Start, "DemodPSK"))
+				return;
 
 			return;  // Wait for more samples
 		}
@@ -5260,9 +5263,8 @@ bool DemodQAM()
 
 			//	(while checking process - will use cyclic buffer eventually
 
-			if (intFilteredMixedSamplesLength > 0)
-				memmove(intFilteredMixedSamples,
-					&intFilteredMixedSamples[Start], intFilteredMixedSamplesLength * 2);
+			if (!compactFilteredMixedSamples(Start, "DemodQAM"))
+				return false;
 
 			return false;
 		}

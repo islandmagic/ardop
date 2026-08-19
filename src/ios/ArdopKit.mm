@@ -238,7 +238,7 @@ static void *ardopkit_pump_main(void *ctx)
 	g_externalAudioKit = nil;
 
 	// Full teardown so the next start() does not inherit stuck TX/RX flags,
-	// a live RX thread, repeat machinery, or stale host queue lines.
+	// stale capture buffers, repeat machinery, or stale host queue lines.
 	(void)KeyPTT(false);
 	SoundIsPlaying = false;
 	Capturing = false;

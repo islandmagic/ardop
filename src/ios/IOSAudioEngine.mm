@@ -4,9 +4,11 @@
  * Implements common/audio.h using AVAudioSession + AVAudioEngine.
  *
  * Audio model:
- * - RX: installTap on inputNode, convert to 12kHz mono int16, then deliver
- *       ReceiveSize blocks to ProcessNewSamples() when Capturing else
- *       PreprocessNewSamples().
+ * - RX: installTap (or external 48 kHz feed) converts to 12 kHz mono int16
+ *       into a ring. ardopmain’s PollReceivedSamples() drains ReceiveSize
+ *       blocks and calls ProcessNewSamples() when Capturing else
+ *       PreprocessNewSamples(). StartCaptureInternal() purges the ring so
+ *       TX-era samples never delay the remote’s reply.
  * - TX: SendtoCard() copies 12kHz int16 into a ring (same sizing idea as macOS
  *       CoreAudioSound.c). AVAudioSourceNode pulls continuously at the hardware
  *       rate and applies the same linear SRC as macOS’s non-converter path —
@@ -368,9 +370,8 @@ static OSStatus ios_tx_source_render(BOOL *isSilence, const AudioTimeStamp *when
 	return noErr;
 }
 
-// ---- RX ring + processing thread (12kHz int16) ------------------------------
+// ---- RX ring (12kHz int16). Demod runs on ardopmain via PollReceivedSamples.
 static pthread_mutex_t rx_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t rx_cv = PTHREAD_COND_INITIALIZER;
 
 // ~3 seconds at 12kHz
 #define RX_RING_CAP (12000 * 3)
@@ -378,9 +379,6 @@ static int16_t rx_ring[RX_RING_CAP];
 static size_t rx_r = 0;
 static size_t rx_w = 0;
 static size_t rx_n = 0;
-static bool rx_stopping = false;
-static pthread_t rx_thread;
-static bool rx_thread_running = false;
 
 static void rx_ring_reset(void)
 {
@@ -402,18 +400,22 @@ static size_t rx_ring_push(const int16_t *in, size_t n)
 		rx_n++;
 		pushed++;
 	}
-	pthread_cond_signal(&rx_cv);
 	pthread_mutex_unlock(&rx_mu);
 	return pushed;
 }
 
-static size_t rx_ring_pop_wait(int16_t *out, size_t need)
+// Non-blocking: copies `need` samples only when that many are already queued.
+// Must not be called while holding rx_mu around the demodulator.
+static size_t rx_ring_pop_nowait(int16_t *out, size_t need)
 {
 	size_t popped = 0;
 	pthread_mutex_lock(&rx_mu);
-	while (rx_n < need && !rx_stopping)
-		pthread_cond_wait(&rx_cv, &rx_mu);
-	while (popped < need && rx_n > 0)
+	if (rx_n < need)
+	{
+		pthread_mutex_unlock(&rx_mu);
+		return 0;
+	}
+	while (popped < need)
 	{
 		out[popped++] = rx_ring[rx_r];
 		rx_r = (rx_r + 1) % RX_RING_CAP;
@@ -421,54 +423,6 @@ static size_t rx_ring_pop_wait(int16_t *out, size_t need)
 	}
 	pthread_mutex_unlock(&rx_mu);
 	return popped;
-}
-
-static void *rx_proc_main(void *arg)
-{
-	(void)arg;
-	int16_t block[ReceiveSize];
-	while (1)
-	{
-		if (rx_stopping)
-			break;
-		size_t n = rx_ring_pop_wait(block, ReceiveSize);
-		if (n < ReceiveSize)
-			continue;
-		if (!RXEnabled)
-			continue;
-
-		// Deliver on non-realtime thread.
-		if (Capturing)
-			ProcessNewSamples((short *)block, ReceiveSize);
-		else
-			(void)PreprocessNewSamples((short *)block, ReceiveSize);
-	}
-	return NULL;
-}
-
-static void rx_thread_start_if_needed(void)
-{
-	if (rx_thread_running)
-		return;
-	rx_stopping = false;
-	rx_ring_reset();
-	if (pthread_create(&rx_thread, NULL, rx_proc_main, NULL) == 0)
-		rx_thread_running = true;
-	else
-		ZF_LOGE("Failed to create RX processing thread");
-}
-
-static void rx_thread_stop_if_running(void)
-{
-	if (!rx_thread_running)
-		return;
-	pthread_mutex_lock(&rx_mu);
-	rx_stopping = true;
-	pthread_cond_broadcast(&rx_cv);
-	pthread_mutex_unlock(&rx_mu);
-	pthread_join(rx_thread, NULL);
-	rx_thread_running = false;
-	rx_ring_reset();
 }
 
 // ---- AVAudioEngine state ---------------------------------------------------
@@ -668,6 +622,8 @@ static void StartCaptureInternal(void)
 	Capturing = true;
 	DiscardOldSamples();
 	ClearAllMixedSamples();
+	// Drop TX-era samples accumulated while ardopmain was blocked in SoundFlush.
+	rx_ring_reset();
 	State = SearchingForLeader;
 }
 
@@ -1121,7 +1077,7 @@ static void StopEngine(void)
 {
 	if (!engine)
 		return;
-	rx_thread_stop_if_running();
+	rx_ring_reset();
 	RemoveRxTap();
 	[player stop];
 	[engine stop];
@@ -1226,7 +1182,7 @@ extern "C" void CloseSoundCapture(bool do_getdevices)
 	}
 	RXEnabled = false;
 	CaptureDevice[0] = '\0';
-	rx_thread_stop_if_running();
+	rx_ring_reset();
 	if (ios_external_audio_active())
 	{
 		NSLog(@"Ardop iOS: CloseSoundCapture (external audio, no engine)");
@@ -1353,7 +1309,6 @@ extern "C" bool OpenSoundCapture(char *devstr, int ch)
 	if (ios_external_audio_active())
 	{
 		ZF_LOGI("Ardop iOS: OpenSoundCapture \"%s\" (external audio, no engine)", devstr);
-		rx_thread_start_if_needed();
 		// Mirror Linux ALSA: enable decode immediately when not transmitting.
 		// Without this, Capturing stays false until after the first TX, so cold
 		// listen never decodes ConReq.
@@ -1373,7 +1328,6 @@ extern "C" bool OpenSoundCapture(char *devstr, int ch)
 	ZF_LOGI("Ardop iOS: OpenSoundCapture -> %s", ok ? "OK" : "FAIL");
 	if (ok)
 	{
-		rx_thread_start_if_needed();
 		if (!SoundIsPlaying)
 			StartCaptureInternal();
 	}
@@ -1475,7 +1429,17 @@ extern "C" bool SendtoCard(int n)
 
 extern "C" void PollReceivedSamples(void)
 {
-	// RX is delivered via input tap. Nothing to poll.
+	if (!RXEnabled || dev_is_nosound(CaptureDevice))
+		return;
+
+	int16_t block[ReceiveSize];
+	while (rx_ring_pop_nowait(block, ReceiveSize) == ReceiveSize)
+	{
+		if (Capturing)
+			ProcessNewSamples((short *)block, ReceiveSize);
+		else
+			(void)PreprocessNewSamples((short *)block, ReceiveSize);
+	}
 }
 
 extern "C" void StopCapture(void)
@@ -1487,7 +1451,7 @@ extern "C" void MacVirtualCaptureFeed(const short *samples, size_t count)
 {
 	if (!samples || count == 0)
 		return;
-	// Feed virtual capture into the same RX queue, then let the RX thread deliver.
+	// Feed virtual capture into the same RX queue; PollReceivedSamples delivers.
 	(void)rx_ring_push((const int16_t *)samples, count);
 }
 
