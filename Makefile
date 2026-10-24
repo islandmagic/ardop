@@ -301,15 +301,15 @@ xcframework-ios:
 	@set -e; \
 	$(MAKE) libardopkit PLATFORM=ios \
 		CC="xcrun --sdk iphoneos clang" \
-		CFLAGS="-g -O2 -MMD -target arm64-apple-ios18.5" \
+		CFLAGS="-g -O2 -MMD -fno-common -target arm64-apple-ios18.5" \
 		LDFLAGS="-target arm64-apple-ios18.5"; \
 	$(MAKE) libardopkit PLATFORM=ios-sim-arm64 \
 		CC="xcrun --sdk iphonesimulator clang" \
-		CFLAGS="-g -O2 -MMD -target arm64-apple-ios18.5-simulator" \
+		CFLAGS="-g -O2 -MMD -fno-common -target arm64-apple-ios18.5-simulator" \
 		LDFLAGS="-target arm64-apple-ios18.5-simulator"; \
 	$(MAKE) libardopkit PLATFORM=ios-sim-x86_64 \
 		CC="xcrun --sdk iphonesimulator clang" \
-		CFLAGS="-g -O2 -MMD -target x86_64-apple-ios18.5-simulator" \
+		CFLAGS="-g -O2 -MMD -fno-common -target x86_64-apple-ios18.5-simulator" \
 		LDFLAGS="-target x86_64-apple-ios18.5-simulator"; \
 	$(call MKDIR,build/xcframework-headers); \
 	cp src/ios/ArdopKit.h build/xcframework-headers/; \
