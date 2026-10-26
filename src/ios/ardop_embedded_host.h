@@ -64,6 +64,14 @@ void ardop_host_wake(void);
 // stale CONNECTED / DISCONNECTED / PTT lines to a new session.
 void ardop_host_reset(void);
 
+// Optional synchronous PTT hook. Invoked on the modem thread from
+// TCPSendCommandToHostQuiet *before* the "PTT TRUE"/"PTT FALSE" text is
+// queued for the app. Lets the embedding app key the radio (e.g. CI-V over
+// Wi-Fi) before the first TX audio datagram of the same over. Pass NULL to
+// clear. The text line is still enqueued so host-text observers keep working.
+typedef void (*ardop_host_ptt_handler_fn)(bool on, void *ctx);
+void ardop_host_set_ptt_handler(ardop_host_ptt_handler_fn handler, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

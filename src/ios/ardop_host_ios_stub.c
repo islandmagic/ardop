@@ -19,9 +19,10 @@
 #include "common/ardopcommon.h"
 #include "ios/ardop_embedded_host.h"
  
- // Debug helper implemented in IOSAudioEngine.mm (plays a tone through the iOS audio graph).
- void ArdopPlayTestTone(double freq_hz, int duration_ms);
- void ArdopAudioDump(char *dst, size_t dstsz);
+ // Debug helpers implemented in IOSAudioEngine.mm.
+void ArdopPlayTestTone(double freq_hz, int duration_ms);
+void ArdopAudioDump(char *dst, size_t dstsz);
+void ArdopExternalAudioNotePtt(bool on);
 
 // From HostInterface.c
 void ProcessCommandFromHost(char *strCMD);
@@ -69,6 +70,29 @@ static host_data_item_t host_data_q[HOST_DATA_QCAP];
 static unsigned host_data_r = 0;
 static unsigned host_data_w = 0;
 static unsigned host_data_n = 0;
+
+// ---- Synchronous PTT hook (modem thread → embedding app) ------------------
+static pthread_mutex_t host_ptt_mu = PTHREAD_MUTEX_INITIALIZER;
+static ardop_host_ptt_handler_fn host_ptt_handler = NULL;
+static void *host_ptt_ctx = NULL;
+
+void ardop_host_set_ptt_handler(ardop_host_ptt_handler_fn handler, void *ctx)
+{
+	pthread_mutex_lock(&host_ptt_mu);
+	host_ptt_handler = handler;
+	host_ptt_ctx = ctx;
+	pthread_mutex_unlock(&host_ptt_mu);
+}
+
+static void host_ptt_invoke(bool on)
+{
+	pthread_mutex_lock(&host_ptt_mu);
+	ardop_host_ptt_handler_fn handler = host_ptt_handler;
+	void *ctx = host_ptt_ctx;
+	pthread_mutex_unlock(&host_ptt_mu);
+	if (handler != NULL)
+		handler(on, ctx);
+}
 
 // ---- Event signaling (for native wrappers) --------------------------------
 static pthread_mutex_t host_evt_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -145,6 +169,17 @@ static void host_data_enqueue(const char tag_in[4], const uint8_t *data, size_t 
  
  void TCPSendCommandToHostQuiet(char *strText)
  {
+	// KeyPTT with no local serial/HID device emits "PTT TRUE"/"PTT FALSE" here.
+	// Invoke the embedding app's hook first so CI-V PTT leads the audio datagrams.
+	if (strText != NULL) {
+		if (strcmp(strText, "PTT TRUE") == 0) {
+			ArdopExternalAudioNotePtt(true);
+			host_ptt_invoke(true);
+		} else if (strcmp(strText, "PTT FALSE") == 0) {
+			ArdopExternalAudioNotePtt(false);
+			host_ptt_invoke(false);
+		}
+	}
 	host_text_enqueue(ARDOP_HOST_TEXT_QUIET, strText);
  }
  

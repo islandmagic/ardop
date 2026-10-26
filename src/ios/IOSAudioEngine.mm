@@ -112,6 +112,9 @@ static bool g_ext_tx_has_last_sample = false;
 // 48 kHz → 12 kHz boxcar decimation carry (partial group of 4 samples).
 static int g_ext_rx_carry_sum = 0;
 static int g_ext_rx_carry_count = 0;
+/// Wall time of KeyPTT(true) for the current over (ms, same clock as Now).
+static unsigned int g_ext_tx_over_start_ms = 0;
+static bool g_ext_tx_logged_first_chunk = false;
 
 static inline bool ios_external_audio_active(void)
 {
@@ -127,8 +130,29 @@ extern "C" void ArdopSetExternalAudio(ardop_external_tx_fn tx, ardop_external_tx
 	g_ext_tx_has_last_sample = false;
 	g_ext_rx_carry_sum = 0;
 	g_ext_rx_carry_count = 0;
+	g_ext_tx_over_start_ms = 0;
+	g_ext_tx_logged_first_chunk = false;
 	g_external_audio_enabled.store(tx != NULL, std::memory_order_release);
 	ZF_LOGI("Ardop iOS: external audio %s", tx != NULL ? "enabled" : "disabled");
+}
+
+/// Called from the host stub when KeyPTT emits "PTT TRUE"/"PTT FALSE" so
+/// SoundFlush / first-chunk logs can measure against the over start.
+extern "C" void ArdopExternalAudioNotePtt(bool on)
+{
+	if (!ios_external_audio_active())
+		return;
+	if (on)
+	{
+		g_ext_tx_over_start_ms = Now;
+		g_ext_tx_logged_first_chunk = false;
+		ZF_LOGI("Ardop iOS: external TX over start (PTT-on)");
+	}
+	else
+	{
+		unsigned int overMs = (g_ext_tx_over_start_ms != 0) ? (Now - g_ext_tx_over_start_ms) : 0;
+		ZF_LOGI("Ardop iOS: external TX PTT-off after %u ms", overMs);
+	}
 }
 
 extern "C" void ArdopClearExternalAudio(void)
@@ -194,6 +218,14 @@ static bool ios_external_sendtocard(const short *samples12k, int n)
 	}
 	g_ext_tx_last_sample = prev;
 	g_ext_tx_has_last_sample = true;
+
+	if (!g_ext_tx_logged_first_chunk)
+	{
+		g_ext_tx_logged_first_chunk = true;
+		unsigned int sincePtt = (g_ext_tx_over_start_ms != 0) ? (Now - g_ext_tx_over_start_ms) : 0;
+		ZF_LOGI("Ardop iOS: external TX first chunk n=%d (48k=%zu) +%u ms after PTT-on",
+			n, outn, sincePtt);
+	}
 
 	tx(out48k, outn, g_external_ctx);
 	SoundIsPlaying = true;
@@ -1467,6 +1499,7 @@ extern "C" bool SoundFlush(void)
 		// fully played out before dropping PTT — mirrors the engine drain below.
 		// Re-load the drained callback each iteration: teardown may clear it while
 		// we wait (cancel during ConReq). Treat NULL / disabled as drained.
+		unsigned int drainWaitMs = 0;
 		if (TXEnabled && !dev_is_nosound(PlaybackDevice))
 		{
 			unsigned int waitStart = Now;
@@ -1489,10 +1522,18 @@ extern "C" bool SoundFlush(void)
 					break;
 				}
 			}
+			drainWaitMs = Now - waitStart;
 			// Small tail so the rig finishes its buffered frames before PTT drops.
 			usleep(60000);
 		}
+		{
+			unsigned int overMs = (g_ext_tx_over_start_ms != 0) ? (Now - g_ext_tx_over_start_ms) : 0;
+			ZF_LOGI("Ardop iOS: SoundFlush(external) over=%u ms drainWait=%u ms txlenMs=%d",
+				overMs, drainWaitMs, txlenMs);
+		}
 		g_ext_tx_has_last_sample = false;
+		g_ext_tx_logged_first_chunk = false;
+		g_ext_tx_over_start_ms = 0;
 
 		SoundIsPlaying = false;
 		if (blnEnbARQRpt > 0 || blnDISCRepeating)

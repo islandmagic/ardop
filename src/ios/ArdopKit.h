@@ -62,9 +62,17 @@ typedef NS_ENUM(NSInteger, ArdopKitRunState) {
 - (BOOL)ardopKitIsTransmitAudioDrained:(ArdopKit *)kit;
 @end
 
+/// Called on the modem thread when the modem asserts / releases PTT (before the
+/// matching "PTT TRUE"/"PTT FALSE" host-text line is queued). Use this to key a
+/// network rig so CI-V PTT leads the first TX audio datagram of the over.
+typedef void (^ArdopKitPTTHandler)(BOOL on);
+
 @interface ArdopKit : NSObject
 
 @property (nonatomic, weak, nullable) id<ArdopKitDelegate> delegate;
+
+/// Optional synchronous PTT actuation. Set before ARQCALL / listen. Cleared on stop.
+@property (nonatomic, copy, nullable) ArdopKitPTTHandler pttHandler;
 
 // Starts the modem worker thread and begins pumping outbound events to delegate.
 // Safe to call multiple times.

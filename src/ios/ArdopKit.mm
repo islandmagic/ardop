@@ -37,6 +37,22 @@ extern "C" void ArdopExternalAudioFeedRx(const short *pcm48k, size_t count);
 // One external sink at a time (ArdopKit is effectively a singleton around ardopmain()).
 static ArdopKit *g_externalAudioKit = nil;
 static id<ArdopKitExternalAudioSink> g_externalAudioSink = nil;
+/// Kit that owns the sync PTT hook (independent of external-audio enable).
+static ArdopKit *g_pttHandlerKit = nil;
+
+static void ardopkit_ptt_trampoline(bool on, void *ctx)
+{
+	(void)ctx;
+	ArdopKit *kit = g_pttHandlerKit;
+	ArdopKitPTTHandler handler = nil;
+	if (kit != nil)
+		handler = kit.pttHandler;
+	if (handler == nil)
+		return;
+	@autoreleasepool {
+		handler(on ? YES : NO);
+	}
+}
 
 static void ardopkit_external_tx_trampoline(const short *pcm48k, size_t count, void *ctx)
 {
@@ -191,6 +207,11 @@ static void *ardopkit_pump_main(void *ctx)
 	blnClosing = false;
 	_pumpStop = false;
 
+	// Register the sync PTT hook before the worker starts so the first ConReq
+	// KeyPTT(true) is never missed. Independent of external-audio enable.
+	g_pttHandlerKit = self;
+	ardop_host_set_ptt_handler(ardopkit_ptt_trampoline, NULL);
+
 	int rc = pthread_create(&_workerThread, NULL, ardopkit_worker_main, (__bridge void *)self);
 	if (rc != 0)
 	{
@@ -234,8 +255,11 @@ static void *ardopkit_pump_main(void *ctx)
 
 	// Worker is gone — safe to drop C function pointers used by SoundFlush.
 	ArdopClearExternalAudio();
+	ardop_host_set_ptt_handler(NULL, NULL);
+	g_pttHandlerKit = nil;
 	g_externalAudioSink = nil;
 	g_externalAudioKit = nil;
+	self.pttHandler = nil;
 
 	// Full teardown so the next start() does not inherit stuck TX/RX flags,
 	// stale capture buffers, repeat machinery, or stale host queue lines.
